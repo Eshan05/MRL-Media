@@ -1,0 +1,13 @@
+allowBuilds:
+  '@playwright/browser-chromium': false
+  '@prisma/client': false
+  better-sqlite3: true
+  esbuild: true
+  msgpackr-extract: true
+  protobufjs: false
+  sharp: true
+  unix-dgram: false
+
+# bullmq pins an older ioredis; two copies = two incompatible Redis types
+overrides:
+  ioredis: ^5.11.1

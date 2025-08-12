@@ -1,0 +1,575 @@
+import { createReadStream, createWriteStream, readFileSync } from 'node:fs';
+import { mkdir, stat, unlink } from 'node:fs/promises';
+import { pipeline } from 'node:stream/promises';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import { fromNodeHeaders } from 'better-auth/node';
+import { eq } from 'drizzle-orm';
+import Fastify, { type FastifyError, type FastifyReply, type FastifyRequest } from 'fastify';
+import multipart from '@fastify/multipart';
+import {
+  concurrency,
+  createRedis,
+  fixedWindow,
+  slidingWindow,
+  tokenBucket,
+  trustMultiplier,
+  scaledLimit,
+  violationTracker,
+} from '../limiter/index.js';
+import { createQueueConnection, createTranscodeQueue } from '../jobs/queues.js';
+import { POLICY } from '../policy.js';
+import { auth, toAppUser } from '../auth.js';
+import { db, fileById, filesByUser, recordFile, type UserRow } from '../db.js';
+import { user as authUsers } from '../db/schema/auth.js';
+import { looksPrivateHost } from '../ssrf.js';
+import { queueDepthGauge, recordDecision, registry, workerHeartbeatAge } from './metrics.js';
+
+declare module 'fastify' {
+  interface FastifyRequest {
+    user: UserRow;
+    /** adaptive multiplier (layer 6) computed for this request */
+    trust: number;
+  }
+}
+
+const UPLOAD_DIR = fileURLToPath(new URL('../../uploads/', import.meta.url));
+const PUBLIC_DIR = fileURLToPath(new URL('../../public/', import.meta.url));
+const HEARTBEAT_KEY = 'mrl:worker:heartbeat';
+const API_INSTANCE = process.env.API_INSTANCE_ID ?? process.env.HOSTNAME ?? randomUUID();
+
+const redis = createRedis();
+const app = Fastify({
+  logger: true,
+  // behind a reverse proxy req.ip is the proxy — every user would share one
+  // layer-1 bucket. Set TRUST_PROXY=1 in that deployment.
+  trustProxy: process.env.TRUST_PROXY === '1',
+});
+await app.register(multipart, { limits: { fileSize: POLICY.maxFileBytes, files: 1 } });
+
+// clients get intent, not internals (no paths, no stack traces)
+app.setErrorHandler((err: FastifyError, req, reply) => {
+  req.log.error(err);
+  if (err.name === 'MaxRetriesPerRequestError' || err.message.includes('Connection is closed')) {
+    // redis unreachable → limiters can't answer → fail closed, honestly
+    return reply.code(503).header('retry-after', 5).send({ error: 'rate_limiter_unavailable' });
+  }
+  if (err.statusCode === 406 && /multipart/i.test(err.message)) {
+    // "not multipart" is the client sending the wrong media type — 415, not 406
+    return reply.code(415).send({ error: 'multipart/form-data required' });
+  }
+  const errWithStatus = err as FastifyError & { status?: number };
+  const rawStatus = err.statusCode ?? errWithStatus.status;
+  const status = rawStatus && rawStatus >= 400 && rawStatus < 500 ? rawStatus : 500;
+  return reply.code(status).send({ error: status === 500 ? 'internal_error' : err.message });
+});
+
+const vt = violationTracker(redis, { name: 'api' });
+const transcodeQueue = createTranscodeQueue(createQueueConnection());
+
+// layer 6 backpressure signal, cached so it isn't a redis call per request
+let depthCache = { at: 0, value: 0 };
+async function queueDepth(): Promise<number> {
+  if (Date.now() - depthCache.at > 5_000) {
+    depthCache = { at: Date.now(), value: await transcodeQueue.getWaitingCount() };
+  }
+  return depthCache.value;
+}
+
+// ── layer 1: coarse per-IP fixed window on every route, before auth ────────
+const ipLimiter = fixedWindow(redis, { name: 'ip', ...POLICY.ip });
+
+app.addHook('onRequest', async (req, reply) => {
+  reply.header('x-api-instance', API_INSTANCE);
+  const res = await ipLimiter.check(req.ip);
+  recordDecision('fixed-window-ip', res.allowed);
+  reply.header('x-rl-ip-remaining', res.remaining);
+  setRateLimitHeaders(reply, {
+    limit: POLICY.ip.limit,
+    remaining: res.remaining,
+    resetAt: res.resetAt,
+    policy: `${POLICY.ip.limit};w=${Math.ceil(POLICY.ip.windowMs / 1000)}`,
+  });
+  if (!res.allowed) {
+    reply.header('retry-after', retryAfterSeconds(res.resetAt));
+    return reply.code(429).send({ error: 'rate_limited', layer: 'fixed-window-ip', retryAt: res.resetAt });
+  }
+});
+
+// ── auth ────────────────────────────────────────────────────────────────────
+
+app.route({
+  method: ['GET', 'POST'],
+  url: '/api/auth/*',
+  handler: async (req, reply) => {
+    const origin = `${req.protocol}://${req.headers.host ?? `localhost:${process.env.PORT ?? 3000}`}`;
+    const url = new URL(req.url, origin);
+    const headers = fromNodeHeaders(req.headers);
+    const response = await auth.handler(
+      new Request(url, {
+        method: req.method,
+        headers,
+        body: requestBody(req),
+      }),
+    );
+
+    const responseHeaders = response.headers as Headers & { getSetCookie?: () => string[] };
+    response.headers.forEach((value, key) => {
+      if (key !== 'set-cookie') reply.header(key, value);
+    });
+    const setCookie = responseHeaders.getSetCookie?.() ?? [];
+    if (setCookie.length > 0) reply.header('set-cookie', setCookie);
+
+    reply.code(response.status);
+    return reply.send(Buffer.from(await response.arrayBuffer()));
+  },
+});
+
+/** Better Auth session or API key → user row. Mutations also pass userGate. */
+async function authOnly(req: FastifyRequest, reply: FastifyReply) {
+  const session = await auth.api.getSession({ headers: authHeaders(req) });
+  if (!session?.user) {
+    return reply.code(401).send({ error: 'valid session, x-api-key, or Authorization: Bearer <api key> required' });
+  }
+  req.user = toAppUser(session.user);
+}
+
+/** Layers 6 + 2 on top of auth — guards mutations. */
+async function userGate(req: FastifyRequest, reply: FastifyReply) {
+  await authOnly(req, reply);
+  if (reply.sent) return;
+
+  const violations = await vt.count(req.user.id);
+  req.trust = trustMultiplier(
+    {
+      accountAgeDays: (Date.now() - req.user.created_at) / 86_400_000,
+      recentViolations: violations,
+      globalQueueDepth: await queueDepth(),
+    },
+    POLICY.adaptive,
+  );
+  reply.header('x-rl-trust', req.trust.toFixed(3));
+
+  const sw = slidingWindow(redis, {
+    name: 'user',
+    limit: scaledLimit(POLICY.user.limit, req.trust),
+    windowMs: POLICY.user.windowMs,
+  });
+  const res = await sw.check(req.user.id);
+  recordDecision('sliding-window-user', res.allowed);
+  reply.header('x-rl-user-remaining', res.remaining);
+  const userLimit = scaledLimit(POLICY.user.limit, req.trust);
+  setRateLimitHeaders(reply, {
+    limit: userLimit,
+    remaining: res.remaining,
+    resetAt: res.resetAt,
+    policy: `${userLimit};w=${Math.ceil(POLICY.user.windowMs / 1000)}`,
+  });
+  if (!res.allowed) {
+    await vt.record(req.user.id);
+    reply.header('retry-after', retryAfterSeconds(res.resetAt));
+    return reply.code(429).send({ error: 'rate_limited', layer: 'sliding-window-user', retryAt: res.resetAt });
+  }
+}
+
+// ── accounts ────────────────────────────────────────────────────────────────
+
+const signupLimiter = fixedWindow(redis, { name: 'signup', ...POLICY.signup });
+
+app.post('/signup', async (req, reply) => {
+  const res = await signupLimiter.check(req.ip);
+  recordDecision('fixed-window-signup', res.allowed);
+  setRateLimitHeaders(reply, {
+    limit: POLICY.signup.limit,
+    remaining: res.remaining,
+    resetAt: res.resetAt,
+    policy: `${POLICY.signup.limit};w=${Math.ceil(POLICY.signup.windowMs / 1000)}`,
+  });
+  if (!res.allowed) {
+    await reply.header('retry-after', retryAfterSeconds(res.resetAt));
+    return reply.code(429).send({ error: 'rate_limited', layer: 'fixed-window-signup', retryAt: res.resetAt });
+  }
+  const body = (req.body ?? {}) as { name?: unknown; email?: unknown; password?: unknown };
+  const name = typeof body.name === 'string' && body.name.trim().length > 0 ? body.name.trim().slice(0, 64) : null;
+  if (!name) {
+    return reply.code(422).send({ error: 'name required' });
+  }
+  const email =
+    typeof body.email === 'string' && body.email.trim().length > 0
+      ? body.email.trim().toLowerCase()
+      : `${slugForEmail(name)}-${randomUUID()}@local.test`;
+  const password =
+    typeof body.password === 'string' && body.password.length >= 8
+      ? body.password
+      : `dev-${randomUUID()}-password`;
+
+  const user = await createUserWithApiKey({ name, email, password, tier: 'free', ageDays: 0 });
+  return reply.code(201).send({
+    userId: user.id,
+    apiKey: user.apiKey,
+    tier: user.tier,
+    note: 'new accounts start at 0.5x trust — limits grow as the account ages cleanly',
+  });
+});
+
+/**
+ * Test/ops backdoor, disabled unless ADMIN_KEY is set: create users with
+ * arbitrary tier and account age. This is how the test suites get
+ * deterministic trust (age 30d → 1.0x) without waiting a month.
+ */
+app.post('/admin/users', async (req, reply) => {
+  const adminKey = process.env.ADMIN_KEY;
+  if (!adminKey) {
+    return reply.code(503).send({ error: 'admin api disabled (ADMIN_KEY not set)' });
+  }
+  const given = typeof req.headers['x-admin-key'] === 'string' ? req.headers['x-admin-key'] : '';
+  const a = createHash('sha256').update(given).digest();
+  const b = createHash('sha256').update(adminKey).digest();
+  if (!timingSafeEqual(a, b)) {
+    return reply.code(401).send({ error: 'bad admin key' });
+  }
+  const body = (req.body ?? {}) as {
+    name?: unknown;
+    email?: unknown;
+    password?: unknown;
+    tier?: unknown;
+    ageDays?: unknown;
+  };
+  const name = typeof body.name === 'string' && body.name.length > 0 ? body.name.slice(0, 64) : 'test-user';
+  const email =
+    typeof body.email === 'string' && body.email.trim().length > 0
+      ? body.email.trim().toLowerCase()
+      : `${slugForEmail(name)}-${randomUUID()}@admin.local`;
+  const password =
+    typeof body.password === 'string' && body.password.length >= 8
+      ? body.password
+      : `admin-${randomUUID()}-password`;
+  const tier = body.tier === 'pro' ? 'pro' : 'free';
+  const ageDays = typeof body.ageDays === 'number' && body.ageDays >= 0 ? body.ageDays : 0;
+  const user = await createUserWithApiKey({ name, email, password, tier, ageDays });
+  return reply.code(201).send({ id: user.id, apiKey: user.apiKey, tier: user.tier });
+});
+
+app.get('/me', { preHandler: authOnly }, async (req) => ({
+  id: req.user.id,
+  name: req.user.name,
+  tier: req.user.tier,
+  accountAgeDays: Math.floor((Date.now() - req.user.created_at) / 86_400_000),
+}));
+
+// ── uploads ─────────────────────────────────────────────────────────────────
+
+app.post('/upload', { preHandler: userGate }, async (req, reply) => {
+  // layer 3: uploads are the bursty action — token bucket, scaled by trust
+  const tb = tokenBucket(redis, {
+    name: 'upload',
+    capacity: scaledLimit(POLICY.upload.burst, req.trust),
+    refillPerSec: POLICY.upload.refillPerSec,
+  });
+  const res = await tb.check(req.user.id);
+  recordDecision('token-bucket-upload', res.allowed);
+  reply.header('x-rl-upload-remaining', res.remaining);
+  const uploadLimit = scaledLimit(POLICY.upload.burst, req.trust);
+  setRateLimitHeaders(reply, {
+    limit: uploadLimit,
+    remaining: res.remaining,
+    resetAt: res.resetAt,
+    policy: `${uploadLimit};w=${Math.ceil(uploadLimit / POLICY.upload.refillPerSec)}`,
+  });
+  if (!res.allowed) {
+    await vt.record(req.user.id);
+    reply.header('retry-after', retryAfterSeconds(res.resetAt));
+    return reply.code(429).send({ error: 'rate_limited', layer: 'token-bucket-upload', retryAt: res.resetAt });
+  }
+
+  // optional destination for the media.processed event; syntactic SSRF
+  // screen here, authoritative resolve-time check in the worker
+  const webhookUrl = typeof req.headers['x-webhook-url'] === 'string' ? req.headers['x-webhook-url'] : undefined;
+  if (webhookUrl !== undefined) {
+    let hostname: string | null = null;
+    try {
+      const u = new URL(webhookUrl);
+      hostname = /^https?:$/.test(u.protocol) ? u.hostname : null;
+    } catch {
+      /* not a url */
+    }
+    if (hostname === null) {
+      return reply.code(400).send({ error: 'x-webhook-url must be a http(s) URL' });
+    }
+    if (!POLICY.webhook.allowPrivate && looksPrivateHost(hostname)) {
+      return reply.code(422).send({ error: 'webhook destination must be a public host' });
+    }
+  }
+
+  const data = await req.file();
+  if (!data) {
+    return reply.code(422).send({ error: 'multipart file field required' });
+  }
+
+  // layer 4a: tier-based slots on uploads in flight
+  const slots = concurrency(redis, {
+    name: 'upload-inflight',
+    slots: POLICY.inflight.slots[req.user.tier],
+    ttlMs: POLICY.inflight.ttlMs,
+  });
+  const slot = await slots.acquire(req.user.id);
+  recordDecision('concurrency-upload', slot.acquired);
+  reply.header('x-rl-inflight', `${slot.inUse}/${POLICY.inflight.slots[req.user.tier]}`);
+  if (!slot.acquired || slot.holderId === undefined) {
+    await vt.record(req.user.id);
+    data.file.resume(); // discard the body so the connection can settle
+    return reply
+      .code(429)
+      .send({ error: 'rate_limited', layer: 'concurrency-upload', inFlight: slot.inUse });
+  }
+
+  const id = randomUUID();
+  const storedAs = `${id}${sanitizeExt(data.filename)}`;
+  const dest = path.join(UPLOAD_DIR, storedAs);
+  try {
+    try {
+      await pipeline(data.file, createWriteStream(dest));
+    } catch (err) {
+      // client aborted or disk failed — don't leave a partial file behind
+      await unlink(dest).catch(() => {});
+      throw err;
+    }
+    if (data.file.truncated) {
+      // multipart limits cut the stream silently; a 200 here would hand the
+      // user a corrupt file with no warning
+      await unlink(dest).catch(() => {});
+      return reply.code(413).send({ error: `file exceeds ${POLICY.maxFileBytes} bytes` });
+    }
+    const { size } = await stat(dest);
+
+    recordFile({
+      id,
+      user_id: req.user.id,
+      stored_as: storedAs,
+      original_name: data.filename ?? null,
+      bytes: size,
+    });
+
+    await transcodeQueue.add(
+      'transcode',
+      {
+        fileId: id,
+        storedAs,
+        userId: req.user.id,
+        tier: req.user.tier,
+        originalName: data.filename,
+        bytes: size,
+        webhookUrl,
+      },
+      {
+        jobId: id, // makes GET /jobs/:id trivial
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 1_000 },
+        removeOnComplete: { age: 3_600 },
+        removeOnFail: { age: 86_400 },
+      },
+    );
+
+    reply.code(201).header('location', `/files/${storedAs}`);
+    return {
+      id,
+      filename: data.filename,
+      bytes: size,
+      storedAs,
+      statusUrl: `/jobs/${id}`,
+    };
+  } finally {
+    await slots.release(req.user.id, slot.holderId);
+  }
+});
+
+// ── files (owner-only; 404 for other people's files — no existence leak) ───
+
+// original uploads plus worker derivatives (<uuid>-thumb.webp, <uuid>-web.webp)
+const FILE_NAME_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(-(thumb|web|video))?(\.[a-z0-9]{1,10})?$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const CONTENT_TYPES: Record<string, string> = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.mp4': 'video/mp4',
+  '.txt': 'text/plain',
+  '.json': 'application/json',
+};
+
+app.get('/files', { preHandler: authOnly }, async (req) => ({
+  files: filesByUser(req.user.id).map((f) => ({
+    id: f.id,
+    filename: f.original_name,
+    bytes: f.bytes,
+    url: `/files/${f.stored_as}`,
+    statusUrl: `/jobs/${f.id}`,
+  })),
+}));
+
+app.get('/files/:name', { preHandler: authOnly }, async (req, reply) => {
+  const { name } = req.params as { name: string };
+  if (!FILE_NAME_RE.test(name)) {
+    return reply.code(404).send({ error: 'not_found' });
+  }
+  const owned = fileById(name.slice(0, 36));
+  if (!owned || owned.user_id !== req.user.id) {
+    return reply.code(404).send({ error: 'not_found' });
+  }
+  const file = path.join(UPLOAD_DIR, name);
+  try {
+    await stat(file);
+  } catch {
+    return reply.code(404).send({ error: 'not_found' });
+  }
+  reply.type(CONTENT_TYPES[path.extname(name)] ?? 'application/octet-stream');
+  return reply.send(createReadStream(file));
+});
+
+app.get('/jobs/:id', { preHandler: authOnly }, async (req, reply) => {
+  const { id } = req.params as { id: string };
+  if (!UUID_RE.test(id)) {
+    return reply.code(404).send({ error: 'not_found' });
+  }
+  const owned = fileById(id);
+  if (!owned || owned.user_id !== req.user.id) {
+    return reply.code(404).send({ error: 'not_found' });
+  }
+  const job = await transcodeQueue.getJob(id);
+  if (!job) {
+    return reply.code(404).send({ error: 'not_found' });
+  }
+  const state = await job.getState();
+  return {
+    id,
+    state,
+    outputs: job.returnvalue?.outputs ?? null,
+    failedReason: job.failedReason ?? null,
+    processedOn: job.processedOn ?? null,
+    finishedOn: job.finishedOn ?? null,
+    webhook: job.data.webhookUrl ? 'delivered by worker after processing' : null,
+  };
+});
+
+// ── observability ───────────────────────────────────────────────────────────
+
+app.get('/health', async () => {
+  const [depth, beat] = await Promise.all([queueDepth(), redis.get(HEARTBEAT_KEY)]);
+  return {
+    ok: true,
+    queueDepth: depth,
+    worker: beat === null ? { alive: false } : { alive: true, lastBeatMsAgo: Date.now() - Number(beat) },
+  };
+});
+
+app.get('/metrics', async (_req, reply) => {
+  const [depth, beat] = await Promise.all([queueDepth(), redis.get(HEARTBEAT_KEY)]);
+  queueDepthGauge.set(depth);
+  workerHeartbeatAge.set(beat === null ? -1 : (Date.now() - Number(beat)) / 1000);
+  reply.type('text/plain; version=0.0.4');
+  return registry.metrics();
+});
+
+// demo page — shows every limiter header and which layer fires
+app.get('/', async (_req, reply) => {
+  const html = readFileSync(path.join(PUBLIC_DIR, 'index.html'), 'utf8');
+  return reply.type('text/html').send(html);
+});
+
+function retryAfterSeconds(resetAt: number): number {
+  return Math.max(0, Math.ceil((resetAt - Date.now()) / 1000));
+}
+
+function setRateLimitHeaders(
+  reply: FastifyReply,
+  limit: { limit: number; remaining: number; resetAt: number; policy: string },
+): void {
+  reply.header('ratelimit-limit', limit.limit);
+  reply.header('ratelimit-remaining', Math.max(0, limit.remaining));
+  reply.header('ratelimit-reset', retryAfterSeconds(limit.resetAt));
+  reply.header('ratelimit-policy', limit.policy);
+}
+
+function requestBody(req: FastifyRequest): BodyInit | undefined {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.body === undefined) return undefined;
+  if (typeof req.body === 'string') return req.body;
+  if (req.body instanceof Uint8Array) return Buffer.from(req.body).toString('utf8');
+  return JSON.stringify(req.body);
+}
+
+function authHeaders(req: FastifyRequest): Headers {
+  const headers = fromNodeHeaders(req.headers);
+  const bearer = bearerToken(req.headers.authorization);
+  if (bearer && !headers.has('x-api-key')) headers.set('x-api-key', bearer);
+  return headers;
+}
+
+function bearerToken(value: string | undefined): string | undefined {
+  return value?.startsWith('Bearer ') ? value.slice(7) : undefined;
+}
+
+async function createUserWithApiKey({
+  name,
+  email,
+  password,
+  tier,
+  ageDays,
+}: {
+  name: string;
+  email: string;
+  password: string;
+  tier: 'free' | 'pro';
+  ageDays: number;
+}) {
+  const signedUp = await auth.api.signUpEmail({
+    body: { name, email, password },
+  });
+  const userId = signedUp.user.id;
+  const createdAt = new Date(Date.now() - ageDays * 86_400_000);
+
+  await db
+    .update(authUsers)
+    .set({ tier, createdAt, updatedAt: new Date() })
+    .where(eq(authUsers.id, userId))
+    .run();
+
+  const apiKey = await auth.api.createApiKey({
+    body: {
+      userId,
+      name: 'default',
+      rateLimitEnabled: false,
+    },
+  });
+
+  return { id: userId, apiKey: apiKey.key, tier };
+}
+
+function slugForEmail(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 40) || 'user';
+}
+
+/** filenames are attacker-controlled; only a plain ascii extension survives */
+function sanitizeExt(filename: string | undefined): string {
+  const ext = path.extname(filename ?? '').toLowerCase();
+  return /^\.[a-z0-9]{1,10}$/.test(ext) ? ext : '';
+}
+
+app.addHook('onClose', async () => {
+  await transcodeQueue.close();
+  await redis.quit();
+});
+
+await mkdir(UPLOAD_DIR, { recursive: true });
+const port = Number(process.env.PORT ?? 3000);
+app.listen({ port, host: '0.0.0.0' }).catch((err) => {
+  app.log.error(err);
+  process.exit(1);
+});

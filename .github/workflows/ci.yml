@@ -31,7 +31,7 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm typecheck
+      - run: pnpm lint:ts
       - run: pnpm test
 
       - name: boot 3 api instances + worker

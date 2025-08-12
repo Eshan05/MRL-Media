@@ -1,0 +1,8 @@
+node_modules
+.git
+uploads
+.scale-tmp
+coverage
+*.log
+.env
+C:\tmp

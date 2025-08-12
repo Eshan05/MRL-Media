@@ -1,0 +1,42 @@
+name: srl-scale
+
+services:
+  redis:
+    image: redis:8-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+    environment:
+      PORT: 3000
+      TRUST_PROXY: "1"
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    expose:
+      - "3000"
+
+  worker:
+    build:
+      context: .
+    command: ["pnpm", "exec", "tsx", "src/worker/index.ts"]
+    environment:
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "3210:80"
+    volumes:
+      - ${NGINX_SCALE_CONF:-./scripts/nginx-scale.conf}:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api

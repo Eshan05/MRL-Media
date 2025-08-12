@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    env:
+      TRUST_PROXY: '1'
+      ADMIN_KEY: dev-admin
+      WEBHOOK_ALLOW_PRIVATE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+
+      - name: boot 3 api instances + worker
+        run: |
+          PORT=3211 pnpm exec tsx src/api/server.ts > /tmp/api1.log 2>&1 &
+          PORT=3212 pnpm exec tsx src/api/server.ts > /tmp/api2.log 2>&1 &
+          PORT=3213 pnpm exec tsx src/api/server.ts > /tmp/api3.log 2>&1 &
+          pnpm exec tsx src/worker/index.ts > /tmp/worker.log 2>&1 &
+          for p in 3211 3212 3213; do
+            ok=0
+            for i in $(seq 1 30); do
+              if curl -sf "http://127.0.0.1:$p/health" > /dev/null; then ok=1; break; fi
+              sleep 1
+            done
+            [ "$ok" = "1" ] || { echo "api :$p never became healthy"; cat /tmp/api*.log /tmp/worker.log; exit 1; }
+          done
+
+      - name: layer attribution matrix
+        run: node scripts/layer-matrix.mjs http://127.0.0.1:3211
+
+      - name: distributed correctness (3 nodes, 1 redis)
+        run: node scripts/distributed.mjs
+
+      - name: e2e worker (derivatives, ACL, webhook pacing)
+        run: node scripts/e2e-worker.mjs http://127.0.0.1:3211
+
+      - name: dump logs on failure
+        if: failure()
+        run: cat /tmp/api*.log /tmp/worker.log || true

@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MRL-Media — rate limit playground</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: system-ui, sans-serif;
+    max-width: 880px;
+    margin: 2rem auto;
+    padding: 0 1rem;
+    line-height: 1.5;
+  }
+  h1 { font-size: 1.3rem; }
+  p.sub { opacity: 0.7; margin-top: -0.5rem; }
+  .controls, .auth {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    align-items: center;
+    margin: 1rem 0;
+  }
+  input[type="text"], input[type="email"], input[type="password"] {
+    padding: 0.4rem 0.6rem;
+    border: 1px solid #8884;
+    border-radius: 6px;
+    font: inherit;
+  }
+  button {
+    padding: 0.4rem 0.9rem;
+    border: 1px solid #8886;
+    border-radius: 6px;
+    background: transparent;
+    font: inherit;
+    cursor: pointer;
+  }
+  button:hover { background: #8882; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
+  th, td { text-align: left; padding: 0.35rem 0.6rem; border-bottom: 1px solid #8883; }
+  th { opacity: 0.6; font-weight: 600; }
+  .ok { color: #16a34a; font-weight: 600; }
+  .blocked { color: #dc2626; font-weight: 600; }
+  .layer {
+    display: inline-block;
+    padding: 0.05rem 0.5rem;
+    border-radius: 999px;
+    background: #dc262622;
+    color: #dc2626;
+    font-size: 0.75rem;
+  }
+  .whoami { font-size: 0.85rem; opacity: 0.8; }
+  .hint { font-size: 0.85rem; opacity: 0.7; }
+  code { background: #8882; padding: 0.1rem 0.3rem; border-radius: 4px; }
+  a { cursor: pointer; }
+</style>
+</head>
+<body>
+  <h1>MRL-Media — rate limit playground</h1>
+  <p class="sub">Every response shows what each limiter layer had to say. Spam the button and watch which layer catches you.</p>
+
+  <div class="auth" id="signup-row">
+    <input type="text" id="name" placeholder="your name" size="14" />
+    <input type="email" id="email" placeholder="email" size="22" />
+    <input type="password" id="password" placeholder="password" size="14" />
+    <button id="signup">Sign up</button>
+    <span class="hint">or paste a key:</span>
+    <input type="text" id="paste-key" placeholder="mk_..." size="20" />
+    <button id="use-key">Use</button>
+  </div>
+
+  <div class="auth" id="whoami-row" style="display:none">
+    <span class="whoami" id="whoami"></span>
+    <button id="logout">Forget key</button>
+  </div>
+
+  <div class="controls">
+    <input type="file" id="file" />
+    <input type="text" id="hook" placeholder="webhook url (optional)" size="24" />
+    <button id="upload">Upload</button>
+    <button id="spam">Spam ×12</button>
+    <button id="clear">Clear</button>
+  </div>
+
+  <p class="hint">
+    Layer 1 (fixed window, per IP) → layer 6 (trust multiplier) →
+    layer 2 (sliding window, per user × trust) → layer 3 (token bucket on
+    uploads × trust) → layer 4 (uploads in flight by tier). Getting blocked
+    records a violation, which lowers your trust — and <b>fresh accounts
+    start at 0.5× trust</b>, growing as the account ages cleanly. Watch the
+    <code>trust</code> column.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>time</th><th>status</th><th>blocked by</th><th>trust</th>
+        <th>ip left</th><th>user left</th><th>upload left</th><th>info</th>
+      </tr>
+    </thead>
+    <tbody id="log"></tbody>
+  </table>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const key = () => localStorage.getItem('mrl-key');
+
+  async function refreshWho() {
+    if (!key()) {
+      $('signup-row').style.display = 'flex';
+      $('whoami-row').style.display = 'none';
+      return;
+    }
+    const res = await fetch('/me', { headers: { authorization: 'Bearer ' + key() } });
+    if (res.status !== 200) {
+      localStorage.removeItem('mrl-key');
+      return refreshWho();
+    }
+    const me = await res.json();
+    $('whoami').textContent = `${me.name} · ${me.tier} tier · account age ${me.accountAgeDays}d`;
+    $('signup-row').style.display = 'none';
+    $('whoami-row').style.display = 'flex';
+  }
+
+  $('signup').onclick = async () => {
+    const res = await fetch('/signup', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: $('name').value || 'playground-user',
+        email: $('email').value,
+        password: $('password').value,
+      }),
+    });
+    const body = await res.json();
+    if (res.status === 201) {
+      localStorage.setItem('mrl-key', body.apiKey);
+      alert('Your API key (saved in this browser):\n\n' + body.apiKey + '\n\n' + body.note);
+      refreshWho();
+    } else {
+      alert(`signup failed: ${res.status} ${body.error ?? ''}`);
+    }
+  };
+
+  $('use-key').onclick = () => {
+    if ($('paste-key').value.trim()) {
+      localStorage.setItem('mrl-key', $('paste-key').value.trim());
+      refreshWho();
+    }
+  };
+
+  $('logout').onclick = () => {
+    localStorage.removeItem('mrl-key');
+    refreshWho();
+  };
+
+  function row(r) {
+    const tr = document.createElement('tr');
+    const status = r.status < 300
+      ? `<span class="ok">${r.status}</span>`
+      : `<span class="blocked">${r.status}</span>`;
+    const layer = r.layer ? `<span class="layer">${r.layer}</span>` : '';
+    const info = r.status === 429 && r.retryAt
+      ? `retry in ${Math.max(0, Math.ceil((r.retryAt - Date.now()) / 1000))}s`
+      : (r.bytes != null
+          ? `<a data-open="${r.storedAs}">${r.filename ?? ''} · ${r.bytes} B</a>` +
+            (r.statusUrl ? ` · <a data-job="${r.statusUrl}">job</a>` : '')
+          : (r.error ?? ''));
+    tr.innerHTML =
+      `<td>${new Date().toLocaleTimeString()}</td><td>${status}</td>` +
+      `<td>${layer}</td><td>${r.trust ?? ''}</td>` +
+      `<td>${r.ip ?? ''}</td><td>${r.user ?? ''}</td><td>${r.up ?? ''}</td>` +
+      `<td>${info}</td>`;
+    $('log').prepend(tr);
+  }
+
+  // files and job status need the Bearer key, so plain links won't do
+  $('log').addEventListener('click', async (e) => {
+    const a = e.target.closest('a');
+    if (!a || !key()) return;
+    if (a.dataset.open) {
+      const res = await fetch('/files/' + a.dataset.open, { headers: { authorization: 'Bearer ' + key() } });
+      if (res.status === 200) window.open(URL.createObjectURL(await res.blob()), '_blank');
+      else alert(`file fetch: ${res.status}`);
+    } else if (a.dataset.job) {
+      const res = await fetch(a.dataset.job, { headers: { authorization: 'Bearer ' + key() } });
+      const j = await res.json();
+      alert(JSON.stringify(j, null, 2));
+    }
+  });
+
+  async function send(file) {
+    if (!key()) { alert('sign up first'); return; }
+    try {
+      const headers = { authorization: 'Bearer ' + key() };
+      if ($('hook').value) headers['x-webhook-url'] = $('hook').value;
+      const fd = new FormData();
+      fd.append('file', file);
+      const res = await fetch('/upload', { method: 'POST', headers, body: fd });
+      let body = {};
+      try { body = await res.json(); } catch {}
+      row({
+        status: res.status,
+        trust: res.headers.get('x-rl-trust'),
+        ip: res.headers.get('x-rl-ip-remaining'),
+        user: res.headers.get('x-rl-user-remaining'),
+        up: res.headers.get('x-rl-upload-remaining'),
+        layer: body.layer,
+        retryAt: body.retryAt,
+        bytes: body.bytes,
+        filename: body.filename,
+        storedAs: body.storedAs,
+        statusUrl: body.statusUrl,
+        error: body.error,
+      });
+    } catch (err) {
+      row({ status: 0, error: String(err) });
+    }
+  }
+
+  const tinyFile = () =>
+    new File([`spam ${Date.now()}`], 'spam.txt', { type: 'text/plain' });
+
+  $('upload').onclick = () => {
+    const f = $('file').files[0];
+    send(f ?? tinyFile());
+  };
+
+  $('spam').onclick = async () => {
+    for (let i = 0; i < 12; i++) await send(tinyFile());
+  };
+
+  $('clear').onclick = () => { $('log').innerHTML = ''; };
+
+  refreshWho();
+</script>
+</body>
+</html>

@@ -1,0 +1,54 @@
+config:
+  target: "http://127.0.0.1:3210"
+  processor: "./artillery-local.cjs"
+  http:
+    timeout: 10
+  phases:
+    - name: warmup
+      duration: 10
+      arrivalRate: 50
+    - name: sustain
+      duration: 20
+      arrivalRate: 100
+    - name: ramp
+      duration: 20
+      arrivalRate: 100
+      rampTo: 250
+    - name: high
+      duration: 20
+      arrivalRate: 250
+
+scenarios:
+  - name: health
+    weight: 24
+    flow:
+      - function: "seed"
+      - get:
+          url: "/health"
+          headers:
+            x-forwarded-for: "{{ ip }}"
+
+  - name: upload
+    weight: 1
+    flow:
+      - function: "seed"
+      - post:
+          url: "/signup"
+          headers:
+            x-forwarded-for: "{{ ip }}"
+          json:
+            name: "art-{{ userId }}"
+            email: "art-{{ userId }}@local.test"
+            password: "artillery-password"
+          capture:
+            - json: "$.apiKey"
+              as: "apiKey"
+      - post:
+          url: "/upload"
+          headers:
+            authorization: "Bearer {{ apiKey }}"
+            x-forwarded-for: "{{ ip }}"
+          formData:
+            file:
+              fromFile: "./fixtures/upload.txt"
+              contentType: "text/plain"

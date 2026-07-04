@@ -5,7 +5,10 @@ import { db } from './db.js';
 import * as authSchema from './db/schema/auth.js';
 import type { Tier } from './jobs/types.js';
 
-const baseURL = process.env.BETTER_AUTH_URL ?? `http://localhost:${process.env.PORT ?? 3000}`;
+const renderURL = process.env.RENDER_EXTERNAL_HOSTNAME
+  ? `https://${process.env.RENDER_EXTERNAL_HOSTNAME}`
+  : undefined;
+const baseURL = process.env.BETTER_AUTH_URL ?? renderURL ?? `http://localhost:${process.env.PORT ?? 3000}`;
 const secret =
   process.env.BETTER_AUTH_SECRET ??
   'dev-only-change-me-32-byte-better-auth-secret';

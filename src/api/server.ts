@@ -2,7 +2,6 @@ import { createReadStream, createWriteStream, readFileSync } from 'node:fs';
 import { mkdir, stat, unlink } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { fromNodeHeaders } from 'better-auth/node';
 import { eq } from 'drizzle-orm';
@@ -25,6 +24,7 @@ import { db, fileById, filesByUser, recordFile, type UserRow } from '../db.js';
 import { user as authUsers } from '../db/schema/auth.js';
 import { looksPrivateHost } from '../ssrf.js';
 import { queueDepthGauge, recordDecision, registry, workerHeartbeatAge } from './metrics.js';
+import { PUBLIC_DIR, UPLOAD_DIR } from '../paths.js';
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -34,8 +34,6 @@ declare module 'fastify' {
   }
 }
 
-const UPLOAD_DIR = fileURLToPath(new URL('../../uploads/', import.meta.url));
-const PUBLIC_DIR = fileURLToPath(new URL('../../public/', import.meta.url));
 const HEARTBEAT_KEY = 'mrl:worker:heartbeat';
 const API_INSTANCE = process.env.API_INSTANCE_ID ?? process.env.HOSTNAME ?? randomUUID();
 

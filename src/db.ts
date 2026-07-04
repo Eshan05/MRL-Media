@@ -1,11 +1,11 @@
 import { mkdirSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { desc, eq } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import type { Tier } from './jobs/types.js';
 import { files } from './db/schema/app.js';
+import { DATA_DIR } from './paths.js';
 
 export interface UserRow {
   id: string;
@@ -23,7 +23,6 @@ export interface FileRow {
   created_at: number;
 }
 
-const DATA_DIR = fileURLToPath(new URL('../data/', import.meta.url));
 mkdirSync(DATA_DIR, { recursive: true });
 
 export const sqlite = new Database(path.join(DATA_DIR, 'mrl.db'));

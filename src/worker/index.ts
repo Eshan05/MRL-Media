@@ -1,6 +1,5 @@
 import { mkdir, stat } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { DelayedError, UnrecoverableError, Worker } from 'bullmq';
 import sharp from 'sharp';
@@ -9,8 +8,8 @@ import { createQueueConnection, createWebhookQueue, TRANSCODE_QUEUE, WEBHOOK_QUE
 import { POLICY } from '../policy.js';
 import { postJsonToWebhook, SsrfError } from '../ssrf.js';
 import type { TranscodeJobData, TranscodeOutput, TranscodeResult, WebhookJobData } from '../jobs/types.js';
+import { UPLOAD_DIR } from '../paths.js';
 
-const UPLOAD_DIR = fileURLToPath(new URL('../../uploads/', import.meta.url));
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.m4v', '.webm', '.mkv', '.avi']);
 
 /**

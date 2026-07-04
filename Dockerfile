@@ -14,4 +14,4 @@ RUN pnpm install --frozen-lockfile
 COPY . .
 
 EXPOSE 3000
-CMD ["pnpm", "exec", "tsx", "src/api/server.ts"]
+CMD ["node", "scripts/render-start.mjs"]

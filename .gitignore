@@ -1,6 +1,9 @@
 node_modules/
 dist/
 uploads/
+.tmp/
 .scale-tmp/
 *.db
+*.db-shm
+*.db-wal
 .env

@@ -9,4 +9,5 @@ function appPath(envName: string, fallbackUrl: string): string {
 
 export const DATA_DIR = appPath('DATA_DIR', '../data/');
 export const UPLOAD_DIR = appPath('UPLOAD_DIR', '../uploads/');
+export const TMP_DIR = appPath('TMP_DIR', '../.tmp/');
 export const PUBLIC_DIR = appPath('PUBLIC_DIR', '../public/');

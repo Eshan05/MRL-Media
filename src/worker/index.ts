@@ -1,4 +1,4 @@
-import { mkdir, stat } from 'node:fs/promises';
+import { mkdir } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { DelayedError, UnrecoverableError, Worker } from 'bullmq';
@@ -8,7 +8,8 @@ import { createQueueConnection, createWebhookQueue, TRANSCODE_QUEUE, WEBHOOK_QUE
 import { POLICY } from '../policy.js';
 import { postJsonToWebhook, SsrfError } from '../ssrf.js';
 import type { TranscodeJobData, TranscodeOutput, TranscodeResult, WebhookJobData } from '../jobs/types.js';
-import { UPLOAD_DIR } from '../paths.js';
+import { TMP_DIR } from '../paths.js';
+import { removeTempFile, storage } from '../storage.js';
 
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.m4v', '.webm', '.mkv', '.avi']);
 
@@ -65,14 +66,19 @@ async function warmProcessingPipeline(): Promise<void> {
 
 /** Images get thumb+web; videos get poster+web mp4; anything else is store-only. */
 async function makeDerivatives(fileId: string, storedAs: string): Promise<TranscodeOutput[]> {
-  const src = path.join(UPLOAD_DIR, storedAs);
+  const src = path.join(TMP_DIR, `${fileId}-source${path.extname(storedAs).toLowerCase()}`);
+  await storage.downloadToFile(storedAs, src);
   try {
-    await sharp(src).metadata();
-  } catch {
-    return VIDEO_EXTENSIONS.has(path.extname(storedAs).toLowerCase()) ? makeVideoDerivatives(fileId, src) : [];
-  }
+    try {
+      await sharp(src).metadata();
+    } catch {
+      return VIDEO_EXTENSIONS.has(path.extname(storedAs).toLowerCase()) ? makeVideoDerivatives(fileId, src) : [];
+    }
 
-  return makeImageDerivatives(fileId, src);
+    return makeImageDerivatives(fileId, src);
+  } finally {
+    await removeTempFile(src);
+  }
 }
 
 async function makeImageDerivatives(fileId: string, src: string): Promise<TranscodeOutput[]> {
@@ -84,11 +90,17 @@ async function makeImageDerivatives(fileId: string, src: string): Promise<Transc
   const outputs: TranscodeOutput[] = [];
   for (const { kind, box, quality } of variants) {
     const file = `${fileId}-${kind}.webp`;
-    const info = await sharp(src)
-      .resize(box, box, { fit: 'inside', withoutEnlargement: true })
-      .webp({ quality })
-      .toFile(path.join(UPLOAD_DIR, file));
-    outputs.push({ kind, file, bytes: info.size, url: `/files/${file}` });
+    const dest = path.join(TMP_DIR, file);
+    try {
+      await sharp(src)
+        .resize(box, box, { fit: 'inside', withoutEnlargement: true })
+        .webp({ quality })
+        .toFile(dest);
+      const saved = await storage.putFile(file, dest, 'image/webp');
+      outputs.push({ kind, file, bytes: saved.bytes, url: `/files/${file}` });
+    } finally {
+      await removeTempFile(dest);
+    }
   }
   return outputs;
 }
@@ -96,60 +108,67 @@ async function makeImageDerivatives(fileId: string, src: string): Promise<Transc
 async function makeVideoDerivatives(fileId: string, src: string): Promise<TranscodeOutput[]> {
   const poster = `${fileId}-thumb.webp`;
   const web = `${fileId}-video.mp4`;
-  const posterPath = path.join(UPLOAD_DIR, poster);
-  const webPath = path.join(UPLOAD_DIR, web);
+  const posterPath = path.join(TMP_DIR, poster);
+  const webPath = path.join(TMP_DIR, web);
 
-  await runFfmpeg([
-    '-hide_banner',
-    '-loglevel',
-    'error',
-    '-nostdin',
-    '-y',
-    '-ss',
-    '0',
-    '-i',
-    src,
-    '-frames:v',
-    '1',
-    '-vf',
-    'scale=480:-2:force_original_aspect_ratio=decrease',
-    posterPath,
-  ]);
+  try {
+    await runFfmpeg([
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-nostdin',
+      '-y',
+      '-ss',
+      '0',
+      '-i',
+      src,
+      '-frames:v',
+      '1',
+      '-vf',
+      'scale=480:-2:force_original_aspect_ratio=decrease',
+      posterPath,
+    ]);
 
-  await runFfmpeg([
-    '-hide_banner',
-    '-loglevel',
-    'error',
-    '-nostdin',
-    '-y',
-    '-i',
-    src,
-    '-map',
-    '0:v:0',
-    '-map',
-    '0:a?',
-    '-vf',
-    'scale=1280:-2:force_original_aspect_ratio=decrease',
-    '-c:v',
-    'libx264',
-    '-preset',
-    'veryfast',
-    '-crf',
-    '28',
-    '-c:a',
-    'aac',
-    '-b:a',
-    '128k',
-    '-movflags',
-    '+faststart',
-    webPath,
-  ]);
+    await runFfmpeg([
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-nostdin',
+      '-y',
+      '-i',
+      src,
+      '-map',
+      '0:v:0',
+      '-map',
+      '0:a?',
+      '-vf',
+      'scale=1280:-2:force_original_aspect_ratio=decrease',
+      '-c:v',
+      'libx264',
+      '-preset',
+      'veryfast',
+      '-crf',
+      '28',
+      '-c:a',
+      'aac',
+      '-b:a',
+      '128k',
+      '-movflags',
+      '+faststart',
+      webPath,
+    ]);
 
-  const [posterInfo, webInfo] = await Promise.all([stat(posterPath), stat(webPath)]);
-  return [
-    { kind: 'thumb', file: poster, bytes: posterInfo.size, url: `/files/${poster}` },
-    { kind: 'video', file: web, bytes: webInfo.size, url: `/files/${web}` },
-  ];
+    const [posterInfo, webInfo] = await Promise.all([
+      storage.putFile(poster, posterPath, 'image/webp'),
+      storage.putFile(web, webPath, 'video/mp4'),
+    ]);
+    return [
+      { kind: 'thumb', file: poster, bytes: posterInfo.bytes, url: `/files/${poster}` },
+      { kind: 'video', file: web, bytes: webInfo.bytes, url: `/files/${web}` },
+    ];
+  } finally {
+    await Promise.all([removeTempFile(posterPath), removeTempFile(webPath)]);
+  }
 }
 
 function runFfmpeg(args: string[], timeoutMs = 60_000): Promise<void> {
@@ -176,7 +195,7 @@ function runFfmpeg(args: string[], timeoutMs = 60_000): Promise<void> {
   });
 }
 
-await mkdir(UPLOAD_DIR, { recursive: true });
+await mkdir(TMP_DIR, { recursive: true });
 await warmProcessingPipeline();
 
 const transcodeWorker = new Worker<TranscodeJobData, TranscodeResult>(

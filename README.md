@@ -6,7 +6,7 @@
     <img src="https://img.shields.io/badge/-Fastify-111827?style=for-the-badge&logo=fastify&logoColor=white&color=000000" alt="fastify" />
     <img src="https://img.shields.io/badge/-Redis-111827?style=for-the-badge&logo=redis&logoColor=white&color=dc382d" alt="redis" />
     <img src="https://img.shields.io/badge/-Docker-111827?style=for-the-badge&logo=docker&logoColor=white&color=2496ed" alt="docker" />
-    <img src="https://img.shields.io/badge/-SQLite-111827?style=for-the-badge&logo=sqlite&logoColor=white&color=003b57" alt="sqlite" />
+    <img src="https://img.shields.io/badge/-PostgreSQL-111827?style=for-the-badge&logo=postgresql&logoColor=white&color=4169e1" alt="postgresql" />
   </div>
 
   <h3 align="center">MRL-Media <br /> Distributed Rate Limiter + Media Worker</h3>
@@ -27,14 +27,15 @@ MRL-Media is a project that has an impact while helping me learn six different r
 [![Node.js](https://skillicons.dev/icons?i=nodejs "Node.js")](https://nodejs.org/ "Node.js")
 [![TypeScript](https://skillicons.dev/icons?i=ts "TypeScript")](https://www.typescriptlang.org/ "TypeScript")
 [![Redis](https://skillicons.dev/icons?i=redis "Redis")](https://redis.io/ "Redis")
-[![SQLite](https://skillicons.dev/icons?i=sqlite "SQLite")](https://www.sqlite.org/ "SQLite")
+[![PostgreSQL](https://skillicons.dev/icons?i=postgres "PostgreSQL")](https://www.postgresql.org/ "PostgreSQL")
 [![Docker](https://skillicons.dev/icons?i=docker "Docker")](https://www.docker.com/ "Docker")
 
 - **Language**: TypeScript
 - **API**: Fastify 5, Multipart streaming uploads
-- **Auth**: `better-auth` email & password + API keys, Drizzle schema, SQLite WAL
+- **Auth**: `better-auth` email & password + API keys, Drizzle-managed PostgreSQL schema
 - **Rate limiting**: Redis + Lua for fixed window, sliding window, token bucket, semaphore, GCRA, and violation tracking
 - **Workers**: BullMQ queues for media processing and webhook delivery
+- **Storage**: provider interface with local dev, PostgreSQL object fallback, and S3-compatible AWS/R2/MinIO adapter
 - **Media**: sharp for image derivatives, ffmpeg for video poster/web mp4 output
 - **Observability**: Prometheus `/metrics`, worker heartbeat, queue depth gauges
 - **Proof tooling**: Vitest, Artillery, Redis Cluster smoke, chaos script, Docker Compose replica smoke
@@ -56,7 +57,7 @@ MRL-Media is a project that has an impact while helping me learn six different r
 
 - 🔐 **Better Auth email/password signup** with API key creation.
 - 🔑 **Bearer or `x-api-key` authentication** for API clients.
-- 🗃️ **Drizzle-managed auth schema** plus app-owned file rows.
+- 🗃️ **Drizzle-managed Postgres schema** plus app-owned file/object rows.
 - 🧾 **Owner-only file access**: strangers get 404, anonymous users get 401.
 - 🖼️ **Image derivatives**: thumbnail and web-optimized webp outputs.
 - 🎞️ **Video derivatives**: poster thumbnail plus web mp4 output through ffmpeg.
@@ -75,7 +76,7 @@ MRL-Media is a project that has an impact while helping me learn six different r
 
 - 📊 **Prometheus metrics** for limiter decisions, queue depth, and worker heartbeat age.
 - 🧬 **Redis Cluster-safe keys** using hash tags so Lua scripts stay in one slot.
-- 🧨 **Chaos script** that proves worker death/restart visibility and Redis fail-closed behavior.
+- 🧨 **Chaos script** that proves worker death/restart visibility, Redis fail-closed behavior, and split API/worker storage.
 - ⚖️ **Distributed correctness script** proving shared Redis state across API instances.
 - 📈 **Load, soak, Artillery, and local fixed-arrival scale checks** for laptop-scale regression proof.
 - 🐳 **Docker Compose replica smoke** with nginx + configurable API replicas.
@@ -85,13 +86,13 @@ MRL-Media is a project that has an impact while helping me learn six different r
 ```mermaid
 flowchart LR
   Browser[Playground / API client] --> API[Fastify API]
-  API --> Auth[Better Auth + Drizzle + SQLite]
+  API --> Auth[Better Auth + Drizzle + Postgres]
   API --> Redis[(Redis / Redis Cluster)]
-  API --> Uploads[(uploads/)]
+  API --> Storage[(Object storage: S3/R2 or DB fallback)]
   API --> Queue[BullMQ queues]
   Queue --> Worker[Media + webhook worker]
   Worker --> Redis
-  Worker --> Uploads
+  Worker --> Storage
   Worker --> FFmpeg[ffmpeg / sharp]
   Worker --> Webhook[Webhook receiver]
   API --> Metrics[Prometheus /metrics]
@@ -152,15 +153,15 @@ headers:
 
 ### Prerequisites
 
-Node.js 24+, `pnpm` 11+, Docker Desktop for local Redis, `ffmpeg` available on PATH for local video processing
+Node.js 24+, `pnpm` 11+, Docker Desktop for local Redis/Postgres, `ffmpeg` available on PATH for local video processing
 
 ### Install and run
 
 ```bash
 pnpm install
 pnpm auth:generate
+pnpm infra:up
 pnpm db:push
-pnpm redis:up
 pnpm dev:api
 pnpm dev:worker
 ```
@@ -190,7 +191,7 @@ pnpm exec tsx src/api/server.ts
 
 ```bash
 pnpm test                  # Vitest limiter/security tests
-pnpm typecheck             # TypeScript check
+pnpm lint:ts               # TypeScript check
 pnpm test:slow             # L2 full-trust + L5 retry edge proofs
 pnpm e2e:video             # Generate/upload mp4 and verify poster + web mp4
 node scripts/e2e-worker.mjs http://127.0.0.1:3210
@@ -213,12 +214,27 @@ Create a `.env` file:
 
 ```env
 REDIS_URL=redis://localhost:6379
+DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5433/mrl_media
+STORAGE_DRIVER=database
 PORT=3000
 BETTER_AUTH_URL=http://localhost:3000
 BETTER_AUTH_SECRET=change-me-at-least-32-bytes-long
 ADMIN_KEY=dev-admin
 TRUST_PROXY=0
 WEBHOOK_ALLOW_PRIVATE=0
+```
+
+`STORAGE_DRIVER=database` is a no-extra-credentials deployment fallback. For
+AWS S3, Cloudflare R2, MinIO, or another S3-compatible store, use:
+
+```env
+STORAGE_DRIVER=s3
+S3_BUCKET=mrl-media
+S3_REGION=auto
+S3_ENDPOINT=https://<account>.r2.cloudflarestorage.com
+S3_ACCESS_KEY_ID=...
+S3_SECRET_ACCESS_KEY=...
+S3_FORCE_PATH_STYLE=0
 ```
 
 Local Redis Cluster uses extra env vars. `pnpm redis:cluster` prints the exact
@@ -241,4 +257,5 @@ REDIS_CLUSTER_NAT_MAP=host.docker.internal:7000=127.0.0.1:7000,host.docker.inter
 ## 📝 Additional Notes
 
 - `WEBHOOK_ALLOW_PRIVATE=1` is for local tests only. Production must leave it off.
-- SQLite WAL - A serverless deployment would need external storage and a separate worker runtime.
+- Render demo uses separate API/worker services with Render Postgres-backed object storage unless S3 credentials are provided.
+- S3/R2 is the preferred production media store; Postgres object storage is the no-credentials fallback for small demo files.

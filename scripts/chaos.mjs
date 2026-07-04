@@ -10,8 +10,12 @@ import { adminUser } from './_helpers.mjs';
 const PORT = Number(process.env.CHAOS_PORT ?? 3299);
 const BASE = `http://127.0.0.1:${PORT}`;
 const REDIS_URL = process.env.CHAOS_REDIS_URL ?? 'redis://localhost:6379/15';
+const DATABASE_URL =
+  process.env.CHAOS_DATABASE_URL ?? process.env.DATABASE_URL ?? 'postgres://postgres:postgres@127.0.0.1:5433/mrl_media';
+const STORAGE_DRIVER = process.env.CHAOS_STORAGE_DRIVER ?? 'database';
 const logDir = resolve('.scale-tmp/chaos');
 const tsxCli = resolve('node_modules/tsx/dist/cli.mjs');
+const drizzleCli = resolve('node_modules/drizzle-kit/bin.cjs');
 mkdirSync(logDir, { recursive: true });
 const children = [];
 const results = [];
@@ -57,17 +61,20 @@ async function waitHealth(predicate, timeoutMs = 30_000) {
 }
 
 try {
-  run('docker', ['compose', 'up', '-d', 'redis']);
+  run('docker', ['compose', 'up', '-d', 'redis', 'postgres']);
+  run(process.execPath, [drizzleCli, 'push', '--force'], { env: { ...process.env, DATABASE_URL } });
   run('docker', ['exec', 'srl-redis', 'redis-cli', '-n', '15', 'FLUSHDB']);
   start('api', ['src/api/server.ts'], {
     REDIS_URL,
+    DATABASE_URL,
+    STORAGE_DRIVER,
     PORT: String(PORT),
     TRUST_PROXY: '1',
     ADMIN_KEY: 'dev-admin',
     WEBHOOK_ALLOW_PRIVATE: '1',
     BETTER_AUTH_URL: BASE,
   });
-  let worker = start('worker', ['src/worker/index.ts'], { REDIS_URL, WEBHOOK_ALLOW_PRIVATE: '1' });
+  let worker = start('worker', ['src/worker/index.ts'], { REDIS_URL, DATABASE_URL, STORAGE_DRIVER, WEBHOOK_ALLOW_PRIVATE: '1' });
 
   await waitHealth((_status, json) => json.worker?.alive === true);
   report('worker heartbeat comes alive', true, BASE);
@@ -76,15 +83,35 @@ try {
   await waitHealth((_status, json) => json.worker?.alive === false, 25_000);
   report('worker death is visible in /health', true, 'heartbeat expired');
 
-  worker = start('worker', ['src/worker/index.ts'], { REDIS_URL, WEBHOOK_ALLOW_PRIVATE: '1' });
+  worker = start('worker', ['src/worker/index.ts'], { REDIS_URL, DATABASE_URL, STORAGE_DRIVER, WEBHOOK_ALLOW_PRIVATE: '1' });
   await waitHealth((_status, json) => json.worker?.alive === true);
   report('worker restart restores heartbeat', true, 'alive=true');
 
   const { apiKey } = await adminUser(BASE, { name: `chaos-${Date.now()}` });
   const fd = new FormData();
-  fd.append('file', new File(['chaos'], 'chaos.txt', { type: 'text/plain' }));
+  fd.append(
+    'file',
+    new File(
+      ['<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="#38bdf8"/></svg>'],
+      'chaos.svg',
+      { type: 'image/svg+xml' },
+    ),
+  );
   const upload = await fetch(`${BASE}/upload`, { method: 'POST', headers: { authorization: `Bearer ${apiKey}` }, body: fd });
+  const uploaded = await upload.json().catch(() => null);
   report('post-restart upload works', upload.status === 201, `status=${upload.status}`);
+  let job = null;
+  for (let i = 0; uploaded?.statusUrl && i < 15; i++) {
+    const res = await fetch(`${BASE}${uploaded.statusUrl}`, { headers: { authorization: `Bearer ${apiKey}` } });
+    job = await res.json();
+    if (job.state === 'completed' || job.state === 'failed') break;
+    await sleep(500);
+  }
+  report(
+    'split worker reads/writes shared object storage',
+    job?.state === 'completed' && job.outputs?.length === 2,
+    `state=${job?.state ?? 'missing'}`,
+  );
 
   run('docker', ['pause', 'srl-redis'], { allowFail: true });
   const failClosed = await fetch(`${BASE}/health`, {

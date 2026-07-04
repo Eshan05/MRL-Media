@@ -1,11 +1,8 @@
-import { mkdirSync } from 'node:fs';
-import path from 'node:path';
-import Database from 'better-sqlite3';
 import { desc, eq } from 'drizzle-orm';
-import { drizzle } from 'drizzle-orm/better-sqlite3';
+import { drizzle } from 'drizzle-orm/node-postgres';
+import { Pool } from 'pg';
 import type { Tier } from './jobs/types.js';
 import { files } from './db/schema/app.js';
-import { DATA_DIR } from './paths.js';
 
 export interface UserRow {
   id: string;
@@ -23,50 +20,37 @@ export interface FileRow {
   created_at: number;
 }
 
-mkdirSync(DATA_DIR, { recursive: true });
+const connectionString = process.env.DATABASE_URL ?? 'postgres://postgres:postgres@127.0.0.1:5433/mrl_media';
 
-export const sqlite = new Database(path.join(DATA_DIR, 'mrl.db'));
-// WAL so multiple API instances (one file, N processes) read while one writes
-sqlite.pragma('journal_mode = WAL');
-sqlite.pragma('busy_timeout = 5000');
+export const pool = new Pool({
+  connectionString,
+  ssl: process.env.DATABASE_SSL === '1' ? { rejectUnauthorized: false } : undefined,
+});
 
-export const db = drizzle(sqlite);
+export const db = drizzle(pool);
 
-sqlite.exec(`
-  CREATE TABLE IF NOT EXISTS files (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    stored_as TEXT NOT NULL UNIQUE,
-    original_name TEXT,
-    bytes INTEGER NOT NULL,
-    created_at INTEGER NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_files_user ON files(user_id);
-`);
-
-export function recordFile(file: Omit<FileRow, 'created_at'>): void {
-  db.insert(files)
-    .values({
-      id: file.id,
-      user_id: file.user_id,
-      stored_as: file.stored_as,
-      original_name: file.original_name,
-      bytes: file.bytes,
-      created_at: Date.now(),
-    })
-    .run();
+export async function recordFile(file: Omit<FileRow, 'created_at'>): Promise<void> {
+  await db.insert(files).values({
+    id: file.id,
+    user_id: file.user_id,
+    stored_as: file.stored_as,
+    original_name: file.original_name,
+    bytes: file.bytes,
+    created_at: Date.now(),
+  });
 }
 
-export function fileById(id: string): FileRow | undefined {
-  return db.select().from(files).where(eq(files.id, id)).get() as FileRow | undefined;
+export async function fileById(id: string): Promise<FileRow | undefined> {
+  const [row] = await db.select().from(files).where(eq(files.id, id)).limit(1);
+  return row as FileRow | undefined;
 }
 
-export function filesByUser(userId: string): FileRow[] {
-  return db
+export async function filesByUser(userId: string): Promise<FileRow[]> {
+  const rows = await db
     .select()
     .from(files)
     .where(eq(files.user_id, userId))
     .orderBy(desc(files.created_at))
-    .limit(100)
-    .all() as FileRow[];
+    .limit(100);
+  return rows as FileRow[];
 }

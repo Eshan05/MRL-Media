@@ -1,5 +1,5 @@
-import { createReadStream, createWriteStream, readFileSync } from 'node:fs';
-import { mkdir, stat, unlink } from 'node:fs/promises';
+import { createWriteStream, readFileSync } from 'node:fs';
+import { mkdir, stat } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
@@ -24,7 +24,8 @@ import { db, fileById, filesByUser, recordFile, type UserRow } from '../db.js';
 import { user as authUsers } from '../db/schema/auth.js';
 import { looksPrivateHost } from '../ssrf.js';
 import { queueDepthGauge, recordDecision, registry, workerHeartbeatAge } from './metrics.js';
-import { PUBLIC_DIR, UPLOAD_DIR } from '../paths.js';
+import { PUBLIC_DIR, TMP_DIR } from '../paths.js';
+import { contentTypeForKey, removeTempFile, storage } from '../storage.js';
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -324,24 +325,25 @@ app.post('/upload', { preHandler: userGate }, async (req, reply) => {
 
   const id = randomUUID();
   const storedAs = `${id}${sanitizeExt(data.filename)}`;
-  const dest = path.join(UPLOAD_DIR, storedAs);
+  const dest = path.join(TMP_DIR, `${id}.upload${path.extname(storedAs)}`);
   try {
     try {
       await pipeline(data.file, createWriteStream(dest));
     } catch (err) {
       // client aborted or disk failed — don't leave a partial file behind
-      await unlink(dest).catch(() => {});
+      await removeTempFile(dest);
       throw err;
     }
     if (data.file.truncated) {
       // multipart limits cut the stream silently; a 200 here would hand the
       // user a corrupt file with no warning
-      await unlink(dest).catch(() => {});
+      await removeTempFile(dest);
       return reply.code(413).send({ error: `file exceeds ${POLICY.maxFileBytes} bytes` });
     }
     const { size } = await stat(dest);
+    await storage.putFile(storedAs, dest, data.mimetype ?? contentTypeForKey(storedAs));
 
-    recordFile({
+    await recordFile({
       id,
       user_id: req.user.id,
       stored_as: storedAs,
@@ -378,6 +380,7 @@ app.post('/upload', { preHandler: userGate }, async (req, reply) => {
       statusUrl: `/jobs/${id}`,
     };
   } finally {
+    await removeTempFile(dest);
     await slots.release(req.user.id, slot.holderId);
   }
 });
@@ -388,19 +391,8 @@ app.post('/upload', { preHandler: userGate }, async (req, reply) => {
 const FILE_NAME_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(-(thumb|web|video))?(\.[a-z0-9]{1,10})?$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const CONTENT_TYPES: Record<string, string> = {
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.png': 'image/png',
-  '.gif': 'image/gif',
-  '.webp': 'image/webp',
-  '.mp4': 'video/mp4',
-  '.txt': 'text/plain',
-  '.json': 'application/json',
-};
-
 app.get('/files', { preHandler: authOnly }, async (req) => ({
-  files: filesByUser(req.user.id).map((f) => ({
+  files: (await filesByUser(req.user.id)).map((f) => ({
     id: f.id,
     filename: f.original_name,
     bytes: f.bytes,
@@ -414,18 +406,16 @@ app.get('/files/:name', { preHandler: authOnly }, async (req, reply) => {
   if (!FILE_NAME_RE.test(name)) {
     return reply.code(404).send({ error: 'not_found' });
   }
-  const owned = fileById(name.slice(0, 36));
+  const owned = await fileById(name.slice(0, 36));
   if (!owned || owned.user_id !== req.user.id) {
     return reply.code(404).send({ error: 'not_found' });
   }
-  const file = path.join(UPLOAD_DIR, name);
-  try {
-    await stat(file);
-  } catch {
+  const object = await storage.getObject(name);
+  if (!object) {
     return reply.code(404).send({ error: 'not_found' });
   }
-  reply.type(CONTENT_TYPES[path.extname(name)] ?? 'application/octet-stream');
-  return reply.send(createReadStream(file));
+  reply.type(object.contentType);
+  return reply.send(object.stream);
 });
 
 app.get('/jobs/:id', { preHandler: authOnly }, async (req, reply) => {
@@ -433,7 +423,7 @@ app.get('/jobs/:id', { preHandler: authOnly }, async (req, reply) => {
   if (!UUID_RE.test(id)) {
     return reply.code(404).send({ error: 'not_found' });
   }
-  const owned = fileById(id);
+  const owned = await fileById(id);
   if (!owned || owned.user_id !== req.user.id) {
     return reply.code(404).send({ error: 'not_found' });
   }
@@ -532,8 +522,7 @@ async function createUserWithApiKey({
   await db
     .update(authUsers)
     .set({ tier, createdAt, updatedAt: new Date() })
-    .where(eq(authUsers.id, userId))
-    .run();
+    .where(eq(authUsers.id, userId));
 
   const apiKey = await auth.api.createApiKey({
     body: {
@@ -565,7 +554,7 @@ app.addHook('onClose', async () => {
   await redis.quit();
 });
 
-await mkdir(UPLOAD_DIR, { recursive: true });
+await mkdir(TMP_DIR, { recursive: true });
 const port = Number(process.env.PORT ?? 3000);
 app.listen({ port, host: '0.0.0.0' }).catch((err) => {
   app.log.error(err);

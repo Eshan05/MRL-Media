@@ -9,3 +9,22 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+  postgres:
+    image: postgres:18-alpine
+    container_name: mrl-postgres
+    environment:
+      POSTGRES_DB: mrl_media
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - mrl-postgres18:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mrl_media"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  mrl-postgres18:

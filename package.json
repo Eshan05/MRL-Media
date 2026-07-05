@@ -21,6 +21,7 @@
     "redis:cluster:down": "node scripts/redis-cluster.mjs --down",
     "chaos": "node scripts/chaos.mjs",
     "e2e:video": "node scripts/e2e-video.mjs",
+    "e2e:anonymous": "node scripts/e2e-anonymous.mjs",
     "infra:up": "docker compose up -d redis postgres",
     "redis:up": "docker compose up -d redis",
     "redis:down": "docker compose down"

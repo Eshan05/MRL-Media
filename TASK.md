@@ -24,6 +24,10 @@ Every item gets verified live before it's checked off.
   Verified live: metadata-endpoint webhook → 422 on a prod-mode instance
 - [x] **T1.3 Files ACL** — ownership rows; owner 200, stranger 404,
   anonymous 401 — all asserted in e2e
+- [x] **Product access model correction** — no-account uploads are allowed
+  with lower IP-keyed limits, public/private `/media/*` links, no anonymous
+  listing/editing, and 7-day default expiry; authenticated users keep `/files/*`
+  history/edit/delete controls.
 - [x] Bonus: S8 root-caused and fixed properly — free tier's 3 transcode
   slots were parking the 4th job (layer 4b working as designed), staggering
   the webhook enqueues the scenario measures. S8 now uses a pro user.

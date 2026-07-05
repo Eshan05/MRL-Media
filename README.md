@@ -13,7 +13,7 @@
 
   <div align="center">
     Media upload API built to make six rate-limiting algorithms real:
-    Authenticated uploads, worker slots, webhook pacing, adaptive trust,
+    Anonymous and authenticated uploads, worker slots, webhook pacing, adaptive trust,
     Redis Lua atomicity, and local scale / chaos proof.
   </div>
 </div>
@@ -32,7 +32,7 @@ MRL-Media is a project that has an impact while helping me learn six different r
 
 - **Language**: TypeScript
 - **API**: Fastify 5, Multipart streaming uploads
-- **Auth**: `better-auth` email & password + API keys, Drizzle-managed PostgreSQL schema
+- **Auth**: `better-auth` email & password + API keys for owned uploads
 - **Rate limiting**: Redis + Lua for fixed window, sliding window, token bucket, semaphore, GCRA, and violation tracking
 - **Workers**: BullMQ queues for media processing and webhook delivery
 - **Storage**: provider interface with local dev, PostgreSQL object fallback, and S3-compatible AWS/R2/MinIO adapter
@@ -57,8 +57,10 @@ MRL-Media is a project that has an impact while helping me learn six different r
 
 - 🔐 **Better Auth email/password signup** with API key creation.
 - 🔑 **Bearer or `x-api-key` authentication** for API clients.
+- 🌐 **Anonymous uploads** with lower IP-keyed limits, no listing / editing, and automatic expiry.
+- 🔗 **Public/private media links**: public files read at `/media/:name`. Private files require a one-time secret code link.
 - 🗃️ **Drizzle-managed Postgres schema** plus app-owned file/object rows.
-- 🧾 **Owner-only file access**: strangers get 404, anonymous users get 401.
+- 🧾 **Owner-only file management**: `/files/*` is authenticated; strangers get 404, anonymous users get 401.
 - 🖼️ **Image derivatives**: thumbnail and web-optimized webp outputs.
 - 🎞️ **Video derivatives**: poster thumbnail plus web mp4 output through ffmpeg.
 - 🧯 **SSRF guard** for webhook URLs with DNS resolution and private-address blocking.
@@ -115,23 +117,42 @@ flowchart LR
 
 1. Start Redis, the API, and the worker.
 2. Open [http://localhost:3000](http://localhost:3000).
-3. Sign up with email/password; the page stores an API key locally.
-4. Upload a file or use **Spam x12** to watch layers fire in the table.
-5. Add a webhook URL to see worker-delivered events paced by GCRA.
+3. Upload immediately as anonymous, or sign up
+4. Toggle public / private links, upload a file, or use **Spam x12** to watch layers fire in the table.
+5. Signed-in uploads can add a webhook URL to see worker-delivered events paced by GCRA.
 
 Fresh accounts start at `0.5x` trust. Test/admin-created users can be minted
 at older account ages to prove full-trust scenarios.
+Anonymous uploads use fixed low trust, lower upload/concurrency limits, and
+expire after `ANON_RETENTION_DAYS` days, default `7`.
 
 ### API Flow
 
 ```bash
+# No-account public upload
+curl -i -X POST http://localhost:3000/upload \
+  -H 'x-media-visibility: public' \
+  -F 'file=@some-image.jpg'
+
+# No-account private upload
+curl -i -X POST http://localhost:3000/upload \
+  -H 'x-media-visibility: private' \
+  -F 'file=@some-image.jpg'
+
 KEY=$(curl -s -X POST http://localhost:3000/signup \
   -H 'content-type: application/json' \
   -d '{"name":"me","email":"me@example.test","password":"password-12345"}' | jq -r .apiKey)
 
 curl -i -X POST http://localhost:3000/upload \
   -H "authorization: Bearer $KEY" \
+  -H 'x-media-visibility: private' \
   -F "file=@some-image.jpg"
+
+# owner edits
+curl -i -X PATCH http://localhost:3000/files/<file-id> \
+  -H "authorization: Bearer $KEY" \
+  -H 'content-type: application/json' \
+  -d '{"visibility":"public"}'
 ```
 
 Responses include both project-specific headers and IETF-style rate-limit
@@ -194,6 +215,7 @@ pnpm test                  # Vitest limiter/security tests
 pnpm lint:ts               # TypeScript check
 pnpm test:slow             # L2 full-trust + L5 retry edge proofs
 pnpm e2e:video             # Generate/upload mp4 and verify poster + web mp4
+pnpm e2e:anonymous         # Prove no-account upload, private code links, and auth edits
 node scripts/e2e-worker.mjs http://127.0.0.1:3210
 node scripts/layer-matrix.mjs http://127.0.0.1:3210
 node scripts/distributed.mjs
@@ -222,6 +244,9 @@ BETTER_AUTH_SECRET=change-me-at-least-32-bytes-long
 ADMIN_KEY=dev-admin
 TRUST_PROXY=0
 WEBHOOK_ALLOW_PRIVATE=0
+ANON_RETENTION_DAYS=7
+ANON_UPLOAD_BURST=2
+ANON_UPLOAD_REFILL_PER_SEC=0.1
 ```
 
 `STORAGE_DRIVER=database` is a no-extra-credentials deployment fallback. For

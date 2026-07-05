@@ -1,4 +1,4 @@
-import { mkdir } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { DelayedError, UnrecoverableError, Worker } from 'bullmq';
@@ -10,8 +10,14 @@ import { postJsonToWebhook, SsrfError } from '../ssrf.js';
 import type { TranscodeJobData, TranscodeOutput, TranscodeResult, WebhookJobData } from '../jobs/types.js';
 import { TMP_DIR } from '../paths.js';
 import { removeTempFile, storage } from '../storage.js';
+import { fileById } from '../db.js';
 
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.m4v', '.webm', '.mkv', '.avi']);
+
+async function jobFileActive(fileId: string, storedAs: string): Promise<boolean> {
+  const file = await fileById(fileId);
+  return Boolean(file && file.stored_as === storedAs && (file.expires_at === null || file.expires_at > Date.now()));
+}
 
 /**
  * Connection silence is how this worker once died undetected: ioredis
@@ -66,22 +72,26 @@ async function warmProcessingPipeline(): Promise<void> {
 
 /** Images get thumb+web; videos get poster+web mp4; anything else is store-only. */
 async function makeDerivatives(fileId: string, storedAs: string): Promise<TranscodeOutput[]> {
-  const src = path.join(TMP_DIR, `${fileId}-source${path.extname(storedAs).toLowerCase()}`);
-  await storage.downloadToFile(storedAs, src);
+  const object = await storage.getObject(storedAs);
+  if (!object) throw new Error(`object not found: ${storedAs}`);
+  const source = await streamToBuffer(object.stream);
   try {
-    try {
-      await sharp(src).metadata();
-    } catch {
-      return VIDEO_EXTENSIONS.has(path.extname(storedAs).toLowerCase()) ? makeVideoDerivatives(fileId, src) : [];
-    }
+    await sharp(source).metadata();
+    return makeImageDerivatives(fileId, source);
+  } catch {
+    if (!VIDEO_EXTENSIONS.has(path.extname(storedAs).toLowerCase())) return [];
+  }
 
-    return makeImageDerivatives(fileId, src);
+  const src = path.join(TMP_DIR, `${fileId}-source${path.extname(storedAs).toLowerCase()}`);
+  await writeFile(src, source);
+  try {
+    return makeVideoDerivatives(fileId, src);
   } finally {
     await removeTempFile(src);
   }
 }
 
-async function makeImageDerivatives(fileId: string, src: string): Promise<TranscodeOutput[]> {
+async function makeImageDerivatives(fileId: string, src: Buffer): Promise<TranscodeOutput[]> {
   const variants = [
     { kind: 'thumb', box: 256, quality: 80 },
     { kind: 'web', box: 1280, quality: 85 },
@@ -103,6 +113,14 @@ async function makeImageDerivatives(fileId: string, src: string): Promise<Transc
     }
   }
   return outputs;
+}
+
+async function streamToBuffer(stream: NodeJS.ReadableStream): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
 }
 
 async function makeVideoDerivatives(fileId: string, src: string): Promise<TranscodeOutput[]> {
@@ -202,6 +220,9 @@ const transcodeWorker = new Worker<TranscodeJobData, TranscodeResult>(
   TRANSCODE_QUEUE,
   async (job, token) => {
     const { fileId, storedAs, userId, tier, webhookUrl, originalName, bytes } = job.data;
+    if (!(await jobFileActive(fileId, storedAs))) {
+      return { outputs: [] };
+    }
 
     const slots = concurrency(redis, {
       name: 'transcode',
@@ -217,6 +238,10 @@ const transcodeWorker = new Worker<TranscodeJobData, TranscodeResult>(
 
     try {
       const outputs = await makeDerivatives(fileId, storedAs);
+      if (!(await jobFileActive(fileId, storedAs))) {
+        await Promise.all(outputs.map((output) => storage.deleteObject(output.file)));
+        return { outputs: [] };
+      }
 
       if (webhookUrl) {
         await webhookQueue.add(

@@ -4,13 +4,16 @@ export const files = pgTable(
   'files',
   {
     id: text('id').primaryKey(),
-    user_id: text('user_id').notNull(),
+    user_id: text('user_id'),
     stored_as: text('stored_as').notNull().unique(),
     original_name: text('original_name'),
+    visibility: text('visibility').notNull().default('private'),
+    access_code_hash: text('access_code_hash'),
     bytes: bigint('bytes', { mode: 'number' }).notNull(),
     created_at: bigint('created_at', { mode: 'number' }).notNull(),
+    expires_at: bigint('expires_at', { mode: 'number' }),
   },
-  (table) => [index('idx_files_user').on(table.user_id)],
+  (table) => [index('idx_files_user').on(table.user_id), index('idx_files_expiry').on(table.expires_at)],
 );
 
 export const objects = pgTable('objects', {

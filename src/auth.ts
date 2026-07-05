@@ -3,7 +3,7 @@ import { betterAuth } from 'better-auth';
 import { drizzleAdapter } from 'better-auth/adapters/drizzle';
 import { db } from './db.js';
 import * as authSchema from './db/schema/auth.js';
-import type { Tier } from './jobs/types.js';
+import type { AuthTier } from './db.js';
 
 const renderURL = process.env.RENDER_EXTERNAL_HOSTNAME
   ? `https://${process.env.RENDER_EXTERNAL_HOSTNAME}`
@@ -71,7 +71,7 @@ export function toAppUser(user: BetterAuthUser) {
   return {
     id: user.id,
     name: user.name,
-    tier: user.tier === 'pro' ? ('pro' as Tier) : ('free' as Tier),
+    tier: user.tier === 'pro' ? ('pro' as AuthTier) : ('free' as AuthTier),
     created_at: toMillis(user.createdAt),
   };
 }

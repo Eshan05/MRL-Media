@@ -4,6 +4,7 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import path from 'node:path';
 import {
+  DeleteObjectCommand,
   GetObjectCommand,
   PutObjectCommand,
   S3Client,
@@ -25,6 +26,7 @@ export interface StorageProvider {
   putFile(key: string, filePath: string, contentType: string): Promise<{ bytes: number }>;
   getObject(key: string): Promise<StoredObject | null>;
   downloadToFile(key: string, filePath: string): Promise<void>;
+  deleteObject(key: string): Promise<void>;
 }
 
 class LocalStorage implements StorageProvider {
@@ -55,6 +57,10 @@ class LocalStorage implements StorageProvider {
 
   async downloadToFile(key: string, filePath: string): Promise<void> {
     await pipeline(createReadStream(path.join(UPLOAD_DIR, key)), createWriteStream(filePath));
+  }
+
+  async deleteObject(key: string): Promise<void> {
+    await unlink(path.join(UPLOAD_DIR, key)).catch(() => {});
   }
 }
 
@@ -98,6 +104,10 @@ class DatabaseStorage implements StorageProvider {
     const object = await this.getObject(key);
     if (!object) throw new Error(`object not found: ${key}`);
     await writeFile(filePath, Buffer.from(await streamToBuffer(object.stream)));
+  }
+
+  async deleteObject(key: string): Promise<void> {
+    await db.delete(objects).where(eq(objects.object_key, key));
   }
 }
 
@@ -151,6 +161,10 @@ class S3Storage implements StorageProvider {
     const object = await this.getObject(key);
     if (!object) throw new Error(`object not found: ${key}`);
     await pipeline(object.stream, createWriteStream(filePath));
+  }
+
+  async deleteObject(key: string): Promise<void> {
+    await this.client.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: key }));
   }
 }
 

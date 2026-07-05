@@ -1,10 +1,13 @@
-export type Tier = 'free' | 'pro';
+export type Tier = 'anonymous' | 'free' | 'pro';
 
 export interface TranscodeJobData {
   /** uuid shared with the stored file and the /jobs/:id route */
   fileId: string;
   /** filename inside uploads/ */
   storedAs: string;
+  /** authenticated owner id, or null for no-account uploads */
+  ownerId: string | null;
+  /** limiter/concurrency identity; anonymous uploads are keyed by IP hash */
   userId: string;
   tier: Tier;
   originalName?: string;

@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" href="data:," />
 <title>MRL-Media — rate limit playground</title>
 <style>
   :root { color-scheme: light dark; }
@@ -52,6 +53,14 @@
   }
   .whoami { font-size: 0.85rem; opacity: 0.8; }
   .hint { font-size: 0.85rem; opacity: 0.7; }
+  .stack { margin: 1rem 0; }
+  select {
+    padding: 0.4rem 0.6rem;
+    border: 1px solid #8884;
+    border-radius: 6px;
+    font: inherit;
+    background: transparent;
+  }
   code { background: #8882; padding: 0.1rem 0.3rem; border-radius: 4px; }
   a { cursor: pointer; }
 </style>
@@ -72,11 +81,16 @@
 
   <div class="auth" id="whoami-row" style="display:none">
     <span class="whoami" id="whoami"></span>
+    <button id="refresh-files">My files</button>
     <button id="logout">Forget key</button>
   </div>
 
   <div class="controls">
     <input type="file" id="file" />
+    <select id="visibility">
+      <option value="public">Public</option>
+      <option value="private">Private link</option>
+    </select>
     <input type="text" id="hook" placeholder="webhook url (optional)" size="24" />
     <button id="upload">Upload</button>
     <button id="spam">Spam ×12</button>
@@ -88,9 +102,18 @@
     layer 2 (sliding window, per user × trust) → layer 3 (token bucket on
     uploads × trust) → layer 4 (uploads in flight by tier). Getting blocked
     records a violation, which lowers your trust — and <b>fresh accounts
-    start at 0.5× trust</b>, growing as the account ages cleanly. Watch the
-    <code>trust</code> column.
+    start at 0.5× trust</b>. Anonymous uploads use smaller IP-keyed limits and
+    expire automatically. Watch the <code>trust</code> column.
   </p>
+
+  <div class="stack" id="files-panel" style="display:none">
+    <table>
+      <thead>
+        <tr><th>file</th><th>visibility</th><th>share</th><th>actions</th></tr>
+      </thead>
+      <tbody id="files"></tbody>
+    </table>
+  </div>
 
   <table>
     <thead>
@@ -105,11 +128,19 @@
 <script>
   const $ = (id) => document.getElementById(id);
   const key = () => localStorage.getItem('mrl-key');
+  const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  }[ch]));
 
   async function refreshWho() {
     if (!key()) {
       $('signup-row').style.display = 'flex';
       $('whoami-row').style.display = 'none';
+      $('files-panel').style.display = 'none';
       return;
     }
     const res = await fetch('/me', { headers: { authorization: 'Bearer ' + key() } });
@@ -121,6 +152,7 @@
     $('whoami').textContent = `${me.name} · ${me.tier} tier · account age ${me.accountAgeDays}d`;
     $('signup-row').style.display = 'none';
     $('whoami-row').style.display = 'flex';
+    loadFiles();
   }
 
   $('signup').onclick = async () => {
@@ -152,8 +184,57 @@
 
   $('logout').onclick = () => {
     localStorage.removeItem('mrl-key');
+    $('files').innerHTML = '';
     refreshWho();
   };
+
+  $('refresh-files').onclick = () => loadFiles();
+
+  async function loadFiles() {
+    if (!key()) return;
+    const res = await fetch('/files', { headers: { authorization: 'Bearer ' + key() } });
+    if (res.status !== 200) return;
+    const body = await res.json();
+    $('files-panel').style.display = 'block';
+    $('files').innerHTML = '';
+    for (const f of body.files) {
+      const name = esc(f.filename ?? f.storedAs ?? f.id);
+      const mediaUrl = esc(f.mediaUrl);
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        `<td>${name}<br><small>${esc(f.bytes)} B</small></td>` +
+        `<td>${esc(f.visibility)}</td>` +
+        `<td>${f.mediaUrl ? `<a href="${mediaUrl}" target="_blank">open</a>` : '<span class="hint">regenerate private link</span>'}</td>` +
+        `<td>` +
+          `<button data-public="${esc(f.id)}">Public</button> ` +
+          `<button data-private="${esc(f.id)}">Private link</button> ` +
+          `<button data-delete="${esc(f.id)}">Delete</button>` +
+        `</td>`;
+      $('files').append(tr);
+    }
+  }
+
+  $('files').addEventListener('click', async (e) => {
+    const button = e.target.closest('button');
+    if (!button || !key()) return;
+    const id = button.dataset.public || button.dataset.private || button.dataset.delete;
+    if (!id) return;
+    if (button.dataset.delete) {
+      const res = await fetch('/files/' + id, { method: 'DELETE', headers: { authorization: 'Bearer ' + key() } });
+      if (res.status !== 204) alert(`delete failed: ${res.status}`);
+      return loadFiles();
+    }
+    const privateMode = Boolean(button.dataset.private);
+    const res = await fetch('/files/' + id, {
+      method: 'PATCH',
+      headers: { authorization: 'Bearer ' + key(), 'content-type': 'application/json' },
+      body: JSON.stringify({ visibility: privateMode ? 'private' : 'public', regenerateCode: privateMode }),
+    });
+    const body = await res.json();
+    if (res.status >= 300) alert(`update failed: ${res.status} ${body.error ?? ''}`);
+    if (body.mediaUrl) prompt('Share link', location.origin + body.mediaUrl);
+    loadFiles();
+  });
 
   function row(r) {
     const tr = document.createElement('tr');
@@ -164,9 +245,11 @@
     const info = r.status === 429 && r.retryAt
       ? `retry in ${Math.max(0, Math.ceil((r.retryAt - Date.now()) / 1000))}s`
       : (r.bytes != null
-          ? `<a data-open="${r.storedAs}">${r.filename ?? ''} · ${r.bytes} B</a>` +
-            (r.statusUrl ? ` · <a data-job="${r.statusUrl}">job</a>` : '')
-          : (r.error ?? ''));
+          ? `<a href="${esc(r.mediaUrl)}" target="_blank" data-open-url="${esc(r.mediaUrl)}">${esc(r.filename)} · ${esc(r.bytes)} B</a>` +
+            (r.visibility ? ` · ${esc(r.visibility)}` : '') +
+            (r.expiresAt ? ` · expires ${new Date(r.expiresAt).toLocaleDateString()}` : '') +
+            (r.statusUrl ? ` · <a href="${esc(r.statusUrl)}" data-job="${esc(r.statusUrl)}">job</a>` : '')
+          : esc(r.error ?? ''));
     tr.innerHTML =
       `<td>${new Date().toLocaleTimeString()}</td><td>${status}</td>` +
       `<td>${layer}</td><td>${r.trust ?? ''}</td>` +
@@ -175,15 +258,15 @@
     $('log').prepend(tr);
   }
 
-  // files and job status need the Bearer key, so plain links won't do
   $('log').addEventListener('click', async (e) => {
     const a = e.target.closest('a');
-    if (!a || !key()) return;
-    if (a.dataset.open) {
-      const res = await fetch('/files/' + a.dataset.open, { headers: { authorization: 'Bearer ' + key() } });
-      if (res.status === 200) window.open(URL.createObjectURL(await res.blob()), '_blank');
-      else alert(`file fetch: ${res.status}`);
+    if (!a) return;
+    if (a.dataset.openUrl) {
+      e.preventDefault();
+      window.open(a.dataset.openUrl, '_blank');
     } else if (a.dataset.job) {
+      e.preventDefault();
+      if (!key()) return alert('sign in to view jobs');
       const res = await fetch(a.dataset.job, { headers: { authorization: 'Bearer ' + key() } });
       const j = await res.json();
       alert(JSON.stringify(j, null, 2));
@@ -191,9 +274,9 @@
   });
 
   async function send(file) {
-    if (!key()) { alert('sign up first'); return; }
     try {
-      const headers = { authorization: 'Bearer ' + key() };
+      const headers = { 'x-media-visibility': $('visibility').value };
+      if (key()) headers.authorization = 'Bearer ' + key();
       if ($('hook').value) headers['x-webhook-url'] = $('hook').value;
       const fd = new FormData();
       fd.append('file', file);
@@ -211,9 +294,13 @@
         bytes: body.bytes,
         filename: body.filename,
         storedAs: body.storedAs,
+        visibility: body.visibility,
+        mediaUrl: body.mediaUrl,
+        expiresAt: body.expiresAt,
         statusUrl: body.statusUrl,
         error: body.error,
       });
+      if (res.status === 201 && key()) loadFiles();
     } catch (err) {
       row({ status: 0, error: String(err) });
     }

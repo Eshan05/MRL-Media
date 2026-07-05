@@ -1,7 +1,7 @@
 import { createWriteStream, readFileSync } from 'node:fs';
 import { mkdir, stat } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
-import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
 import { fromNodeHeaders } from 'better-auth/node';
 import { eq } from 'drizzle-orm';
@@ -20,7 +20,19 @@ import {
 import { createQueueConnection, createTranscodeQueue } from '../jobs/queues.js';
 import { POLICY } from '../policy.js';
 import { auth, toAppUser } from '../auth.js';
-import { db, fileById, filesByUser, recordFile, type UserRow } from '../db.js';
+import {
+  db,
+  deleteFileRow,
+  deleteFileRowById,
+  expiredFiles,
+  fileById,
+  filesByUser,
+  recordFile,
+  updateFileAccess,
+  type FileRow,
+  type FileVisibility,
+  type UserRow,
+} from '../db.js';
 import { user as authUsers } from '../db/schema/auth.js';
 import { looksPrivateHost } from '../ssrf.js';
 import { queueDepthGauge, recordDecision, registry, workerHeartbeatAge } from './metrics.js';
@@ -29,14 +41,34 @@ import { contentTypeForKey, removeTempFile, storage } from '../storage.js';
 
 declare module 'fastify' {
   interface FastifyRequest {
-    user: UserRow;
+    user?: UserRow;
+    uploadActor?: UploadActor;
     /** adaptive multiplier (layer 6) computed for this request */
-    trust: number;
+    trust?: number;
   }
 }
 
+type UploadActor =
+  | {
+      kind: 'user';
+      key: string;
+      userId: string;
+      tier: 'free' | 'pro';
+      trust: number;
+    }
+  | {
+      kind: 'anonymous';
+      key: string;
+      userId: null;
+      tier: 'anonymous';
+      trust: number;
+    };
+
 const HEARTBEAT_KEY = 'mrl:worker:heartbeat';
 const API_INSTANCE = process.env.API_INSTANCE_ID ?? process.env.HOSTNAME ?? randomUUID();
+const ACCESS_CODE_SALT = process.env.MEDIA_CODE_SECRET ?? process.env.BETTER_AUTH_SECRET ?? 'dev-media-code-secret';
+const ANON_KEY_SALT = process.env.ANON_KEY_SALT ?? process.env.BETTER_AUTH_SECRET ?? 'dev-anonymous-key-secret';
+let cleanupRunning = false;
 
 const redis = createRedis();
 const app = Fastify({
@@ -125,40 +157,90 @@ app.route({
   },
 });
 
-/** Better Auth session or API key → user row. Mutations also pass userGate. */
-async function authOnly(req: FastifyRequest, reply: FastifyReply) {
-  const session = await auth.api.getSession({ headers: authHeaders(req) });
-  if (!session?.user) {
-    return reply.code(401).send({ error: 'valid session, x-api-key, or Authorization: Bearer <api key> required' });
+/** Better Auth session or API key → user row. */
+async function authenticatedUser(req: FastifyRequest): Promise<UserRow | null> {
+  try {
+    const session = await auth.api.getSession({ headers: authHeaders(req) });
+    return session?.user ? toAppUser(session.user) : null;
+  } catch (err) {
+    const status = clientAuthErrorStatus(err);
+    if (status && hasAuthAttempt(req)) {
+      return null;
+    }
+    throw err;
   }
-  req.user = toAppUser(session.user);
 }
 
-/** Layers 6 + 2 on top of auth — guards mutations. */
+async function authOnly(req: FastifyRequest, reply: FastifyReply) {
+  const user = await authenticatedUser(req);
+  if (!user) {
+    return reply.code(401).send({ error: 'valid session, x-api-key, or Authorization: Bearer <api key> required' });
+  }
+  req.user = user;
+}
+
+/** Authenticated mutations still pass layer 6 + layer 2. */
 async function userGate(req: FastifyRequest, reply: FastifyReply) {
   await authOnly(req, reply);
   if (reply.sent) return;
 
-  const violations = await vt.count(req.user.id);
-  req.trust = trustMultiplier(
+  const actor = await rateLimitAuthenticatedUser(req, reply, requireUser(req));
+  if (actor) req.uploadActor = actor;
+}
+
+/** Uploads can be authenticated or no-account anonymous. */
+async function uploadGate(req: FastifyRequest, reply: FastifyReply) {
+  const user = await authenticatedUser(req);
+  if (!user && hasAuthAttempt(req)) {
+    return reply.code(401).send({ error: 'invalid session, x-api-key, or Authorization: Bearer <api key>' });
+  }
+  if (user) {
+    req.user = user;
+    const actor = await rateLimitAuthenticatedUser(req, reply, user);
+    if (!actor) return;
+    req.uploadActor = actor;
+    return;
+  }
+
+  const trust = POLICY.anonymous.trust;
+  req.trust = trust;
+  req.uploadActor = {
+    kind: 'anonymous',
+    key: anonymousKey(req.ip),
+    userId: null,
+    tier: 'anonymous',
+    trust,
+  };
+  reply.header('x-rl-trust', trust.toFixed(3));
+  reply.header('x-rl-user-remaining', 'anonymous');
+}
+
+async function rateLimitAuthenticatedUser(
+  req: FastifyRequest,
+  reply: FastifyReply,
+  user: UserRow,
+): Promise<Extract<UploadActor, { kind: 'user' }> | null> {
+  const violations = await vt.count(user.id);
+  const trust = trustMultiplier(
     {
-      accountAgeDays: (Date.now() - req.user.created_at) / 86_400_000,
+      accountAgeDays: (Date.now() - user.created_at) / 86_400_000,
       recentViolations: violations,
       globalQueueDepth: await queueDepth(),
     },
     POLICY.adaptive,
   );
-  reply.header('x-rl-trust', req.trust.toFixed(3));
+  req.trust = trust;
+  reply.header('x-rl-trust', trust.toFixed(3));
 
   const sw = slidingWindow(redis, {
     name: 'user',
-    limit: scaledLimit(POLICY.user.limit, req.trust),
+    limit: scaledLimit(POLICY.user.limit, trust),
     windowMs: POLICY.user.windowMs,
   });
-  const res = await sw.check(req.user.id);
+  const res = await sw.check(user.id);
   recordDecision('sliding-window-user', res.allowed);
   reply.header('x-rl-user-remaining', res.remaining);
-  const userLimit = scaledLimit(POLICY.user.limit, req.trust);
+  const userLimit = scaledLimit(POLICY.user.limit, trust);
   setRateLimitHeaders(reply, {
     limit: userLimit,
     remaining: res.remaining,
@@ -166,10 +248,12 @@ async function userGate(req: FastifyRequest, reply: FastifyReply) {
     policy: `${userLimit};w=${Math.ceil(POLICY.user.windowMs / 1000)}`,
   });
   if (!res.allowed) {
-    await vt.record(req.user.id);
+    await vt.record(user.id);
     reply.header('retry-after', retryAfterSeconds(res.resetAt));
-    return reply.code(429).send({ error: 'rate_limited', layer: 'sliding-window-user', retryAt: res.resetAt });
+    reply.code(429).send({ error: 'rate_limited', layer: 'sliding-window-user', retryAt: res.resetAt });
+    return null;
   }
+  return { kind: 'user', key: user.id, userId: user.id, tier: user.tier, trust };
 }
 
 // ── accounts ────────────────────────────────────────────────────────────────
@@ -250,34 +334,42 @@ app.post('/admin/users', async (req, reply) => {
   return reply.code(201).send({ id: user.id, apiKey: user.apiKey, tier: user.tier });
 });
 
-app.get('/me', { preHandler: authOnly }, async (req) => ({
-  id: req.user.id,
-  name: req.user.name,
-  tier: req.user.tier,
-  accountAgeDays: Math.floor((Date.now() - req.user.created_at) / 86_400_000),
-}));
+app.get('/me', { preHandler: authOnly }, async (req) => {
+  const user = requireUser(req);
+  return {
+    id: user.id,
+    name: user.name,
+    tier: user.tier,
+    accountAgeDays: Math.floor((Date.now() - user.created_at) / 86_400_000),
+  };
+});
 
 // ── uploads ─────────────────────────────────────────────────────────────────
 
-app.post('/upload', { preHandler: userGate }, async (req, reply) => {
+app.post('/upload', { preHandler: uploadGate }, async (req, reply) => {
+  const actor = requireUploadActor(req);
+  const trust = requireTrust(req);
   // layer 3: uploads are the bursty action — token bucket, scaled by trust
+  const uploadBurst =
+    actor.kind === 'anonymous' ? POLICY.anonymous.uploadBurst : scaledLimit(POLICY.upload.burst, trust);
+  const uploadRefill =
+    actor.kind === 'anonymous' ? POLICY.anonymous.uploadRefillPerSec : POLICY.upload.refillPerSec;
   const tb = tokenBucket(redis, {
     name: 'upload',
-    capacity: scaledLimit(POLICY.upload.burst, req.trust),
-    refillPerSec: POLICY.upload.refillPerSec,
+    capacity: uploadBurst,
+    refillPerSec: uploadRefill,
   });
-  const res = await tb.check(req.user.id);
+  const res = await tb.check(actor.key);
   recordDecision('token-bucket-upload', res.allowed);
   reply.header('x-rl-upload-remaining', res.remaining);
-  const uploadLimit = scaledLimit(POLICY.upload.burst, req.trust);
   setRateLimitHeaders(reply, {
-    limit: uploadLimit,
+    limit: uploadBurst,
     remaining: res.remaining,
     resetAt: res.resetAt,
-    policy: `${uploadLimit};w=${Math.ceil(uploadLimit / POLICY.upload.refillPerSec)}`,
+    policy: `${uploadBurst};w=${Math.ceil(uploadBurst / uploadRefill)}`,
   });
   if (!res.allowed) {
-    await vt.record(req.user.id);
+    if (actor.kind === 'user') await vt.record(actor.userId);
     reply.header('retry-after', retryAfterSeconds(res.resetAt));
     return reply.code(429).send({ error: 'rate_limited', layer: 'token-bucket-upload', retryAt: res.resetAt });
   }
@@ -285,6 +377,9 @@ app.post('/upload', { preHandler: userGate }, async (req, reply) => {
   // optional destination for the media.processed event; syntactic SSRF
   // screen here, authoritative resolve-time check in the worker
   const webhookUrl = typeof req.headers['x-webhook-url'] === 'string' ? req.headers['x-webhook-url'] : undefined;
+  if (webhookUrl !== undefined && actor.kind === 'anonymous') {
+    return reply.code(401).send({ error: 'authentication required for upload webhooks' });
+  }
   if (webhookUrl !== undefined) {
     let hostname: string | null = null;
     try {
@@ -305,18 +400,23 @@ app.post('/upload', { preHandler: userGate }, async (req, reply) => {
   if (!data) {
     return reply.code(422).send({ error: 'multipart file field required' });
   }
+  const visibility = parseVisibility(req.headers['x-media-visibility'], data.fields);
+  if (!visibility) {
+    data.file.resume();
+    return reply.code(422).send({ error: 'x-media-visibility must be public or private' });
+  }
 
   // layer 4a: tier-based slots on uploads in flight
   const slots = concurrency(redis, {
     name: 'upload-inflight',
-    slots: POLICY.inflight.slots[req.user.tier],
+    slots: POLICY.inflight.slots[actor.tier],
     ttlMs: POLICY.inflight.ttlMs,
   });
-  const slot = await slots.acquire(req.user.id);
+  const slot = await slots.acquire(actor.key);
   recordDecision('concurrency-upload', slot.acquired);
-  reply.header('x-rl-inflight', `${slot.inUse}/${POLICY.inflight.slots[req.user.tier]}`);
+  reply.header('x-rl-inflight', `${slot.inUse}/${POLICY.inflight.slots[actor.tier]}`);
   if (!slot.acquired || slot.holderId === undefined) {
-    await vt.record(req.user.id);
+    if (actor.kind === 'user') await vt.record(actor.userId);
     data.file.resume(); // discard the body so the connection can settle
     return reply
       .code(429)
@@ -326,6 +426,8 @@ app.post('/upload', { preHandler: userGate }, async (req, reply) => {
   const id = randomUUID();
   const storedAs = `${id}${sanitizeExt(data.filename)}`;
   const dest = path.join(TMP_DIR, `${id}.upload${path.extname(storedAs)}`);
+  const privateCode = visibility === 'private' ? newAccessCode() : null;
+  const expiresAt = actor.kind === 'anonymous' ? Date.now() + POLICY.anonymous.retentionDays * 86_400_000 : null;
   try {
     try {
       await pipeline(data.file, createWriteStream(dest));
@@ -345,10 +447,13 @@ app.post('/upload', { preHandler: userGate }, async (req, reply) => {
 
     await recordFile({
       id,
-      user_id: req.user.id,
+      user_id: actor.userId,
       stored_as: storedAs,
       original_name: data.filename ?? null,
+      visibility,
+      access_code_hash: privateCode ? hashAccessCode(privateCode) : null,
       bytes: size,
+      expires_at: expiresAt,
     });
 
     await transcodeQueue.add(
@@ -356,8 +461,9 @@ app.post('/upload', { preHandler: userGate }, async (req, reply) => {
       {
         fileId: id,
         storedAs,
-        userId: req.user.id,
-        tier: req.user.tier,
+        ownerId: actor.userId,
+        userId: actor.key,
+        tier: actor.tier,
         originalName: data.filename,
         bytes: size,
         webhookUrl,
@@ -371,43 +477,131 @@ app.post('/upload', { preHandler: userGate }, async (req, reply) => {
       },
     );
 
-    reply.code(201).header('location', `/files/${storedAs}`);
+    const mediaUrl = mediaUrlFor(storedAs, privateCode);
+    reply.code(201).header('location', mediaUrl);
     return {
       id,
       filename: data.filename,
       bytes: size,
       storedAs,
-      statusUrl: `/jobs/${id}`,
+      actor: actor.kind,
+      visibility,
+      expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null,
+      mediaUrl,
+      privateCode,
+      statusUrl: actor.kind === 'user' ? `/jobs/${id}` : null,
     };
   } finally {
     await removeTempFile(dest);
-    await slots.release(req.user.id, slot.holderId);
+    await slots.release(actor.key, slot.holderId);
   }
 });
 
-// ── files (owner-only; 404 for other people's files — no existence leak) ───
+// ── files and share links ───────────────────────────────────────────────────
 
 // original uploads plus worker derivatives (<uuid>-thumb.webp, <uuid>-web.webp)
 const FILE_NAME_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(-(thumb|web|video))?(\.[a-z0-9]{1,10})?$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+app.get('/media/:name', async (req, reply) => {
+  const { name } = req.params as { name: string };
+  if (!FILE_NAME_RE.test(name)) {
+    return reply.code(404).send({ error: 'not_found' });
+  }
+  const file = await fileById(name.slice(0, 36));
+  if (!file || isExpired(file)) {
+    if (file) void purgeFile(file).catch((err) => req.log.warn(err));
+    return reply.code(404).send({ error: 'not_found' });
+  }
+  const owner = await authenticatedUser(req);
+  if (!canReadSharedMedia(file, codeFromQuery(req), owner?.id ?? null)) {
+    return reply.code(404).send({ error: 'not_found' });
+  }
+  const object = await storage.getObject(name);
+  if (!object) {
+    return reply.code(404).send({ error: 'not_found' });
+  }
+  reply.type(object.contentType);
+  return reply.send(object.stream);
+});
+
 app.get('/files', { preHandler: authOnly }, async (req) => ({
-  files: (await filesByUser(req.user.id)).map((f) => ({
+  files: (await filesByUser(requireUser(req).id)).filter((f) => !isExpired(f)).map((f) => ({
     id: f.id,
     filename: f.original_name,
     bytes: f.bytes,
+    visibility: f.visibility,
     url: `/files/${f.stored_as}`,
+    mediaUrl: f.visibility === 'public' ? `/media/${f.stored_as}` : null,
+    expiresAt: f.expires_at ? new Date(f.expires_at).toISOString() : null,
     statusUrl: `/jobs/${f.id}`,
   })),
 }));
 
+app.patch('/files/:id', { preHandler: userGate }, async (req, reply) => {
+  const user = requireUser(req);
+  const { id } = req.params as { id: string };
+  if (!UUID_RE.test(id)) {
+    return reply.code(404).send({ error: 'not_found' });
+  }
+  const current = await fileById(id);
+  if (!current || current.user_id !== user.id) {
+    return reply.code(404).send({ error: 'not_found' });
+  }
+
+  const body = (req.body ?? {}) as { visibility?: unknown; regenerateCode?: unknown };
+  const visibility =
+    body.visibility === undefined
+      ? current.visibility
+      : body.visibility === 'public' || body.visibility === 'private'
+        ? body.visibility
+        : null;
+  if (!visibility) {
+    return reply.code(422).send({ error: 'visibility must be public or private' });
+  }
+  if (body.regenerateCode === true && visibility !== 'private') {
+    return reply.code(422).send({ error: 'private links can only be regenerated for private files' });
+  }
+
+  const shouldGenerateCode =
+    visibility === 'private' && (body.regenerateCode === true || current.access_code_hash === null);
+  const privateCode = shouldGenerateCode ? newAccessCode() : null;
+  const updated = await updateFileAccess({
+    id,
+    userId: user.id,
+    visibility,
+    accessCodeHash:
+      visibility === 'public' ? null : privateCode ? hashAccessCode(privateCode) : current.access_code_hash,
+  });
+  if (!updated) {
+    return reply.code(404).send({ error: 'not_found' });
+  }
+  return fileResponse(updated, privateCode);
+});
+
+app.delete('/files/:id', { preHandler: userGate }, async (req, reply) => {
+  const user = requireUser(req);
+  const { id } = req.params as { id: string };
+  if (!UUID_RE.test(id)) {
+    return reply.code(404).send({ error: 'not_found' });
+  }
+  const removed = await deleteFileRow(id, user.id);
+  if (!removed) {
+    return reply.code(404).send({ error: 'not_found' });
+  }
+  await purgeMediaObjects(removed);
+  return reply.code(204).send();
+});
+
 app.get('/files/:name', { preHandler: authOnly }, async (req, reply) => {
+  const user = requireUser(req);
   const { name } = req.params as { name: string };
   if (!FILE_NAME_RE.test(name)) {
     return reply.code(404).send({ error: 'not_found' });
   }
   const owned = await fileById(name.slice(0, 36));
-  if (!owned || owned.user_id !== req.user.id) {
+  if (!owned || owned.user_id !== user.id || isExpired(owned)) {
     return reply.code(404).send({ error: 'not_found' });
   }
   const object = await storage.getObject(name);
@@ -419,12 +613,13 @@ app.get('/files/:name', { preHandler: authOnly }, async (req, reply) => {
 });
 
 app.get('/jobs/:id', { preHandler: authOnly }, async (req, reply) => {
+  const user = requireUser(req);
   const { id } = req.params as { id: string };
   if (!UUID_RE.test(id)) {
     return reply.code(404).send({ error: 'not_found' });
   }
   const owned = await fileById(id);
-  if (!owned || owned.user_id !== req.user.id) {
+  if (!owned || owned.user_id !== user.id || isExpired(owned)) {
     return reply.code(404).send({ error: 'not_found' });
   }
   const job = await transcodeQueue.getJob(id);
@@ -496,8 +691,132 @@ function authHeaders(req: FastifyRequest): Headers {
   return headers;
 }
 
+function requireUser(req: FastifyRequest): UserRow {
+  if (!req.user) throw new Error('auth invariant violated: req.user missing');
+  return req.user;
+}
+
+function requireUploadActor(req: FastifyRequest): UploadActor {
+  if (!req.uploadActor) throw new Error('upload invariant violated: req.uploadActor missing');
+  return req.uploadActor;
+}
+
+function requireTrust(req: FastifyRequest): number {
+  if (typeof req.trust !== 'number') throw new Error('rate-limit invariant violated: req.trust missing');
+  return req.trust;
+}
+
+function hasAuthAttempt(req: FastifyRequest): boolean {
+  return Boolean(req.headers.authorization || req.headers['x-api-key'] || req.headers.cookie);
+}
+
+function clientAuthErrorStatus(err: unknown): number | null {
+  const e = err as {
+    status?: unknown;
+    statusCode?: unknown;
+    body?: { status?: unknown; statusCode?: unknown; message?: unknown };
+    message?: unknown;
+  };
+  for (const value of [e.status, e.statusCode, e.body?.status, e.body?.statusCode]) {
+    const status = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
+    if (Number.isFinite(status) && status >= 400 && status < 500) return status;
+  }
+  const message = String(e.body?.message ?? e.message ?? '');
+  return /invalid api key|unauthorized|forbidden/i.test(message) ? 401 : null;
+}
+
 function bearerToken(value: string | undefined): string | undefined {
   return value?.startsWith('Bearer ') ? value.slice(7) : undefined;
+}
+
+function anonymousKey(ip: string): string {
+  return `anon:${createHash('sha256').update(ANON_KEY_SALT).update(':').update(ip).digest('hex').slice(0, 24)}`;
+}
+
+function parseVisibility(headerValue: string | string[] | undefined, fields: Record<string, unknown>): FileVisibility | null {
+  const value = firstHeader(headerValue) ?? multipartField(fields, 'visibility') ?? 'public';
+  if (value === 'public' || value === 'private') return value;
+  return null;
+}
+
+function firstHeader(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function multipartField(fields: Record<string, unknown>, name: string): string | undefined {
+  const raw = fields[name];
+  const field = Array.isArray(raw) ? raw[0] : raw;
+  const value = (field as { value?: unknown } | undefined)?.value;
+  return typeof value === 'string' ? value : undefined;
+}
+
+function newAccessCode(): string {
+  return randomBytes(18).toString('base64url');
+}
+
+function hashAccessCode(code: string): string {
+  return createHash('sha256').update(ACCESS_CODE_SALT).update(':').update(code).digest('hex');
+}
+
+function codeFromQuery(req: FastifyRequest): string | undefined {
+  const value = (req.query as { code?: unknown }).code;
+  return typeof value === 'string' && value.length <= 256 ? value : undefined;
+}
+
+function canReadSharedMedia(file: FileRow, code: string | undefined, ownerId: string | null): boolean {
+  if (file.visibility === 'public') return true;
+  if (file.user_id !== null && file.user_id === ownerId) return true;
+  if (!code || !file.access_code_hash) return false;
+  const expected = Buffer.from(file.access_code_hash, 'hex');
+  const actual = Buffer.from(hashAccessCode(code), 'hex');
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
+function isExpired(file: FileRow): boolean {
+  return file.expires_at !== null && file.expires_at <= Date.now();
+}
+
+function mediaUrlFor(storedAs: string, privateCode: string | null): string {
+  const url = `/media/${storedAs}`;
+  return privateCode ? `${url}?code=${encodeURIComponent(privateCode)}` : url;
+}
+
+function fileResponse(file: FileRow, privateCode: string | null = null) {
+  return {
+    id: file.id,
+    filename: file.original_name,
+    bytes: file.bytes,
+    storedAs: file.stored_as,
+    visibility: file.visibility,
+    url: `/files/${file.stored_as}`,
+    mediaUrl: file.visibility === 'public' || privateCode ? mediaUrlFor(file.stored_as, privateCode) : null,
+    privateCode,
+    expiresAt: file.expires_at ? new Date(file.expires_at).toISOString() : null,
+    statusUrl: `/jobs/${file.id}`,
+  };
+}
+
+async function purgeFile(file: FileRow): Promise<void> {
+  await purgeMediaObjects(file);
+  await deleteFileRowById(file.id);
+}
+
+async function purgeMediaObjects(file: FileRow): Promise<void> {
+  const derivativeKeys = [`${file.id}-thumb.webp`, `${file.id}-web.webp`, `${file.id}-video.mp4`];
+  await Promise.all([file.stored_as, ...derivativeKeys].map((key) => storage.deleteObject(key)));
+}
+
+async function cleanupExpiredFiles(): Promise<void> {
+  if (cleanupRunning) return;
+  cleanupRunning = true;
+  try {
+    const rows = await expiredFiles();
+    for (const row of rows) {
+      await purgeFile(row);
+    }
+  } finally {
+    cleanupRunning = false;
+  }
 }
 
 async function createUserWithApiKey({
@@ -555,6 +874,10 @@ app.addHook('onClose', async () => {
 });
 
 await mkdir(TMP_DIR, { recursive: true });
+void cleanupExpiredFiles().catch((err) => app.log.warn(err));
+setInterval(() => {
+  cleanupExpiredFiles().catch((err) => app.log.warn(err));
+}, 60 * 60_000).unref();
 const port = Number(process.env.PORT ?? 3000);
 app.listen({ port, host: '0.0.0.0' }).catch((err) => {
   app.log.error(err);

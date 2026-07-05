@@ -5,6 +5,11 @@ function envInt(name: string, fallback: number): number {
   return Number.isFinite(v) && v > 0 ? v : fallback;
 }
 
+function envFloat(name: string, fallback: number): number {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) && v > 0 ? v : fallback;
+}
+
 /**
  * Every limit, window, and slot count in one place. Server and worker
  * import from here and nowhere else — tuning is a config review, not a
@@ -17,13 +22,21 @@ export const POLICY = {
   signup: { limit: 5, windowMs: 60 * 60_000 },
   /** layer 2 — per-user sliding window, scaled by trust */
   user: { limit: 30, windowMs: 60_000 },
+  /** no-account uploads are intentionally smaller and expire automatically */
+  anonymous: {
+    trust: 0.5,
+    uploadBurst: envInt('ANON_UPLOAD_BURST', 2),
+    uploadRefillPerSec: envFloat('ANON_UPLOAD_REFILL_PER_SEC', 0.1),
+    retentionDays: envInt('ANON_RETENTION_DAYS', 7),
+  },
   /** layer 3 — upload token bucket, scaled by trust */
   upload: { burst: 5, refillPerSec: 0.5 },
   /** layer 4a — simultaneous uploads in flight per user */
-  inflight: { slots: { free: 2, pro: 5 } as Record<Tier, number>, ttlMs: 5 * 60_000 },
+  inflight: { slots: { anonymous: 1, free: 2, pro: 5 } as Record<Tier, number>, ttlMs: 5 * 60_000 },
   /** layer 4b — transcode slots per user (worker) */
   transcode: {
     slots: {
+      anonymous: envInt('TRANSCODE_SLOTS_ANONYMOUS', 1),
       free: envInt('TRANSCODE_SLOTS_FREE', 3),
       pro: envInt('TRANSCODE_SLOTS_PRO', 10),
     } as Record<Tier, number>,

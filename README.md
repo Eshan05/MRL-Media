@@ -1,4 +1,6 @@
 <div align="center">
+  <img src="docs/images/Initial.png" alt="MRL-Media logo" />
+  
   <br />
   <div>
     <img src="https://img.shields.io/badge/-Node.js-111827?style=for-the-badge&logo=node.js&logoColor=white&color=339933" alt="nodejs" />

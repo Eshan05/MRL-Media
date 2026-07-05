@@ -8,7 +8,6 @@ import sharp from 'sharp';
 import { adminUser } from './_helpers.mjs';
 
 const BASE = process.argv[2] ?? 'http://localhost:3000';
-const HOOK_PORT = 45678;
 const results = [];
 const report = (name, ok, detail) => {
   results.push(ok);
@@ -25,7 +24,8 @@ const receiver = createServer((req, res) => {
     res.end('ok');
   });
 });
-await new Promise((r) => receiver.listen(HOOK_PORT, r));
+await new Promise((r) => receiver.listen(0, '127.0.0.1', r));
+const HOOK_PORT = receiver.address().port;
 
 const { apiKey } = await adminUser(BASE, { name: `e2e-${Date.now()}` });
 const auth = { authorization: `Bearer ${apiKey}` };
@@ -99,6 +99,13 @@ if (firstOutputs) {
 
   const anon = await fetch(`${BASE}${firstOutputs[0].url}`);
   report('ACL: anonymous gets 401', anon.status === 401, `got ${anon.status}`);
+
+  const shared = await fetch(`${BASE}${firstOutputs[0].url.replace('/files/', '/media/')}`);
+  report(
+    'public media route is anonymous-readable',
+    shared.status === 200 && shared.headers.get('content-type') === 'image/webp',
+    `got ${shared.status} ${shared.headers.get('content-type')}`,
+  );
 }
 
 // webhook pacing: burst 2, then one per 2s
@@ -112,9 +119,16 @@ if (hits.length === 4) {
   const t = hits.map((h) => h.at);
   const gaps = t.slice(1).map((x, i) => x - t[i]);
   const total = t[3] - t[0];
-  // expected shape: two together (burst), then ~2s, then ~2s again
-  const paced = gaps[1] >= 1500 && gaps[2] >= 1500 && total >= 3400;
-  report('GCRA spacing respected', paced, `gaps=${gaps.join(',')}ms total=${total}ms`);
+  // With burst=2, any three deliveries to the same receiver must span about
+  // one interval; the first two do not have to arrive at the exact same time.
+  const windowA = t[2] - t[0];
+  const windowB = t[3] - t[1];
+  const paced = windowA >= 1500 && windowB >= 1500 && total >= 3400;
+  report(
+    'GCRA spacing respected',
+    paced,
+    `gaps=${gaps.join(',')}ms windows=${windowA},${windowB}ms total=${total}ms`,
+  );
 
   const evt = JSON.parse(hits[0].body);
   report(

@@ -41,7 +41,7 @@ services:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/mrl_media
       STORAGE_DRIVER: database
       ADMIN_KEY: dev-admin
-      RUN_WORKER: "0"
+      WORKER_MODE: api
     command: ["pnpm", "exec", "tsx", "src/api/server.ts"]
     depends_on:
       redis:

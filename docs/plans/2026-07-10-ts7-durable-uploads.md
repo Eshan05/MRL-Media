@@ -71,8 +71,8 @@ The worker owns outbox dispatch:
 - Add PostgreSQL 18 plus schema setup to CI.
 - Repair scale Compose with PostgreSQL, a schema-init service, shared database
   configuration, `ADMIN_KEY`, and `RUN_WORKER=0` for API replicas.
-- Co-locate API and worker on the existing free Render web service by setting
-  `RUN_WORKER=1`; do not create paid infrastructure.
+- Co-locate API and worker on the existing free Render web service with
+  `WORKER_MODE=co-located`; do not create paid infrastructure.
 - `/health` remains informational when a worker is absent, but exposes worker
   and pending-outbox state for explicit verification.
 

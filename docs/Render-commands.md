@@ -20,7 +20,7 @@ REDIS_URL=<render-internal-key-value-url>
 DATABASE_URL=<render-internal-postgres-url>
 STORAGE_DRIVER=database
 TRUST_PROXY=1
-RUN_WORKER=1
+WORKER_MODE=co-located
 WEBHOOK_ALLOW_PRIVATE=0
 BETTER_AUTH_SECRET=<at-least-32-random-bytes>
 MEDIA_CODE_SECRET=<independent-random-secret>
@@ -39,9 +39,10 @@ The Docker image runs:
 node scripts/render-start.mjs
 ```
 
-Startup applies the current Drizzle schema with `db:push`, then starts the API
-and, when `RUN_WORKER` is not `0`, the worker. Formal migrations are deferred
-and should replace schema push before treating this as a production service.
+Startup applies the current Drizzle schema with `db:push`, then starts the API.
+Render web services default to `WORKER_MODE=co-located`; set `WORKER_MODE=api`
+for an API-only service in a future split deployment. Formal migrations are
+deferred and should replace schema push before treating this as production.
 
 ## Verification
 

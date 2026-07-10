@@ -41,7 +41,10 @@ process.once('SIGINT', () => stopAll('SIGINT'));
 await runOnce('db:push', ['db:push', '--force']);
 
 const api = start('api', ['exec', 'tsx', 'src/api/server.ts']);
-if (process.env.RUN_WORKER !== '0') start('worker', ['exec', 'tsx', 'src/worker/index.ts']);
+const workerMode =
+  process.env.WORKER_MODE ??
+  (process.env.RENDER === 'true' ? 'co-located' : process.env.RUN_WORKER === '0' ? 'api' : 'co-located');
+if (workerMode === 'co-located') start('worker', ['exec', 'tsx', 'src/worker/index.ts']);
 
 const code = await new Promise((resolve) => {
   api.once('exit', (exitCode) => resolve(exitCode ?? 1));

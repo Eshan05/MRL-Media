@@ -20,7 +20,7 @@ machine-specific commands belong in Git history, not in this file.
 
 - [x] Complete the TypeScript 7 and durable-upload implementation recorded in
       `docs/plans/2026-07-10-ts7-durable-uploads.md`.
-- [ ] Verify the versioned upload/job contract locally and on Render.
+- [x] Verify the versioned upload/job contract locally and on Render.
 - [x] Capture current desktop and mobile product screenshots.
 
 ## Next Hardening

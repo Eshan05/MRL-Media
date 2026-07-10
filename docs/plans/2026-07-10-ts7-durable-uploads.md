@@ -2,8 +2,13 @@
 
 ## Status
 
-Accepted implementation plan, 2026-07-10. This document records the design
-decisions that should remain stable while the work is implemented.
+Implemented and verified, 2026-07-10. This document records the design
+decisions and the resulting verification baseline.
+
+The implementation landed in `d0becd2` and the Render worker default in
+`c8b6ae3`. GitHub CI passed all checks. Render deployed `c8b6ae3`, reported a
+live worker heartbeat with an empty outbox, and completed an authenticated
+`POST /api/v1/uploads` smoke job from `pending` to `completed`.
 
 ## Goals
 

@@ -1,5 +1,16 @@
 export type Tier = 'anonymous' | 'free' | 'pro';
 
+export const PROCESSING_STATES = [
+  'staging',
+  'pending',
+  'queued',
+  'processing',
+  'completed',
+  'failed',
+] as const;
+
+export type ProcessingState = (typeof PROCESSING_STATES)[number];
+
 export interface TranscodeJobData {
   /** uuid shared with the stored file and the /jobs/:id route */
   fileId: string;

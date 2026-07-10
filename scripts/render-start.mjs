@@ -8,6 +8,7 @@ function start(name, args) {
   const child = spawn(pnpm, args, {
     stdio: 'inherit',
     env: process.env,
+    shell: process.platform === 'win32',
     windowsHide: true,
   });
   children.add(child);

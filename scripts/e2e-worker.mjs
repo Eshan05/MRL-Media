@@ -40,21 +40,21 @@ for (let i = 0; i < 4; i++) {
     .toBuffer();
   const fd = new FormData();
   fd.append('file', new File([png], `pic-${i}.png`, { type: 'image/png' }));
-  const res = await fetch(`${BASE}/upload`, {
+  const res = await fetch(`${BASE}/api/v1/uploads`, {
     method: 'POST',
     headers: { ...auth, 'x-webhook-url': `http://127.0.0.1:${HOOK_PORT}/hook` },
     body: fd,
   });
   const json = await res.json();
-  if (res.status === 201) ids.push(json.id);
+  if (res.status === 202) ids.push(json.id);
   else console.log(`  upload ${i}: ${res.status} ${JSON.stringify(json)}`);
 }
-report('4 image uploads -> 201', ids.length === 4, `got ${ids.length}`);
+report('4 image uploads -> 202', ids.length === 4, `got ${ids.length}`);
 
 async function waitDone(id, timeoutMs = 20_000) {
   const until = Date.now() + timeoutMs;
   while (Date.now() < until) {
-    const res = await fetch(`${BASE}/jobs/${id}`, { headers: auth });
+    const res = await fetch(`${BASE}/api/v1/jobs/${id}`, { headers: auth });
     const json = await res.json();
     if (json.state === 'completed') return json;
     if (json.state === 'failed') throw new Error(`job failed: ${json.failedReason}`);

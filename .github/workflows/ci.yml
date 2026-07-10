@@ -17,10 +17,25 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 5
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: mrl_media
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d mrl_media"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     env:
       TRUST_PROXY: '1'
       ADMIN_KEY: dev-admin
       WEBHOOK_ALLOW_PRIVATE: '1'
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/mrl_media
+      STORAGE_DRIVER: database
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -32,6 +47,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint:ts
+      - run: pnpm db:push --force
       - run: pnpm test
 
       - name: boot 3 api instances + worker
@@ -57,6 +73,9 @@ jobs:
 
       - name: e2e worker (derivatives, ACL, webhook pacing)
         run: node scripts/e2e-worker.mjs http://127.0.0.1:3211
+
+      - name: e2e versioned anonymous and private-link flow
+        run: node scripts/e2e-anonymous.mjs http://127.0.0.1:3211
 
       - name: dump logs on failure
         if: failure()

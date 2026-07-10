@@ -35,7 +35,6 @@ function writeNginxConfig() {
 
 http {
   upstream api_pool {
-    least_conn;
 ${servers}
   }
 

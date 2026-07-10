@@ -4,19 +4,32 @@ import path from 'node:path';
 import { DelayedError, UnrecoverableError, Worker } from 'bullmq';
 import sharp from 'sharp';
 import { concurrency, createRedis, gcra, type RedisClient } from '../limiter/index.js';
-import { createQueueConnection, createWebhookQueue, TRANSCODE_QUEUE, WEBHOOK_QUEUE } from '../jobs/queues.js';
+import {
+  createQueueConnection,
+  createTranscodeQueue,
+  createWebhookQueue,
+  HEARTBEAT_KEY,
+  TRANSCODE_QUEUE,
+  WEBHOOK_QUEUE,
+} from '../jobs/queues.js';
 import { POLICY } from '../policy.js';
 import { postJsonToWebhook, SsrfError } from '../ssrf.js';
 import type { TranscodeJobData, TranscodeOutput, TranscodeResult, WebhookJobData } from '../jobs/types.js';
 import { TMP_DIR } from '../paths.js';
 import { removeTempFile, storage } from '../storage.js';
-import { fileById } from '../db.js';
+import { completeFileProcessing, failFileProcessing, fileById, markFileProcessing } from '../db.js';
+import { startOutboxDispatcher } from '../jobs/outbox-dispatcher.js';
 
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.m4v', '.webm', '.mkv', '.avi']);
 
 async function jobFileActive(fileId: string, storedAs: string): Promise<boolean> {
   const file = await fileById(fileId);
-  return Boolean(file && file.stored_as === storedAs && (file.expires_at === null || file.expires_at > Date.now()));
+  return Boolean(
+    file &&
+      file.stored_as === storedAs &&
+      ['pending', 'queued', 'processing'].includes(file.processing_status) &&
+      (file.expires_at === null || file.expires_at > Date.now()),
+  );
 }
 
 /**
@@ -46,6 +59,7 @@ try {
 }
 
 const webhookQueue = createWebhookQueue(observe(createQueueConnection(), 'webhook-queue'));
+const transcodeDispatchQueue = createTranscodeQueue(observe(createQueueConnection(), 'transcode-outbox'));
 const webhookGate = gcra(redis, {
   name: 'webhook-egress',
   intervalMs: POLICY.webhook.intervalMs,
@@ -85,7 +99,7 @@ async function makeDerivatives(fileId: string, storedAs: string): Promise<Transc
   const src = path.join(TMP_DIR, `${fileId}-source${path.extname(storedAs).toLowerCase()}`);
   await writeFile(src, source);
   try {
-    return makeVideoDerivatives(fileId, src);
+    return await makeVideoDerivatives(fileId, src);
   } finally {
     await removeTempFile(src);
   }
@@ -223,7 +237,6 @@ const transcodeWorker = new Worker<TranscodeJobData, TranscodeResult>(
     if (!(await jobFileActive(fileId, storedAs))) {
       return { outputs: [] };
     }
-
     const slots = concurrency(redis, {
       name: 'transcode',
       slots: POLICY.transcode.slots[tier],
@@ -235,6 +248,7 @@ const transcodeWorker = new Worker<TranscodeJobData, TranscodeResult>(
       await job.moveToDelayed(Date.now() + POLICY.transcode.noSlotRetryMs, token);
       throw new DelayedError();
     }
+    await markFileProcessing(fileId);
 
     try {
       const outputs = await makeDerivatives(fileId, storedAs);
@@ -257,6 +271,7 @@ const transcodeWorker = new Worker<TranscodeJobData, TranscodeResult>(
             },
           },
           {
+            jobId: `${fileId}-processed`,
             attempts: POLICY.webhook.attempts,
             backoff: { type: 'exponential', delay: POLICY.webhook.backoffMs },
             removeOnComplete: { age: 3_600 },
@@ -265,6 +280,7 @@ const transcodeWorker = new Worker<TranscodeJobData, TranscodeResult>(
         );
       }
 
+      await completeFileProcessing(fileId, outputs);
       return { outputs };
     } finally {
       await slots.release(userId, slot.holderId);
@@ -276,6 +292,8 @@ const transcodeWorker = new Worker<TranscodeJobData, TranscodeResult>(
     concurrency: 8,
   },
 );
+
+const outboxDispatcher = startOutboxDispatcher(transcodeDispatchQueue);
 
 const webhookWorker = new Worker<WebhookJobData>(
   WEBHOOK_QUEUE,
@@ -324,8 +342,17 @@ for (const worker of [transcodeWorker, webhookWorker]) {
   });
 }
 
-// liveness signal for the API's /health — absence after 15s means dead/deaf
-export const HEARTBEAT_KEY = 'mrl:worker:heartbeat';
+transcodeWorker.on('failed', (job, err) => {
+  if (!job) return;
+  const maxAttempts = job.opts.attempts ?? 1;
+  if (job.attemptsMade >= maxAttempts) {
+    void failFileProcessing(job.data.fileId, err.message).catch((persistErr: Error) => {
+      console.error(`[${transcodeWorker.name}] failed to persist terminal state: ${persistErr.message}`);
+    });
+  }
+});
+
+// Liveness signal for the API's /health - absence after 15s means dead/deaf.
 await redis.set(HEARTBEAT_KEY, Date.now().toString(), 'PX', 15_000);
 setInterval(() => {
   redis.set(HEARTBEAT_KEY, Date.now().toString(), 'PX', 15_000).catch((err: Error) => {
@@ -334,8 +361,9 @@ setInterval(() => {
 }, 5_000).unref();
 
 async function shutdown() {
+  await outboxDispatcher.close();
   await Promise.all([transcodeWorker.close(), webhookWorker.close()]);
-  await webhookQueue.close();
+  await Promise.all([transcodeDispatchQueue.close(), webhookQueue.close()]);
   await redis.quit();
   process.exit(0);
 }

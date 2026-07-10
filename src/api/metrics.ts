@@ -26,6 +26,12 @@ export const workerHeartbeatAge = new Gauge({
   registers: [registry],
 });
 
+export const outboxPendingGauge = new Gauge({
+  name: 'mrl_job_outbox_pending',
+  help: 'Durable processing events waiting to be dispatched to BullMQ',
+  registers: [registry],
+});
+
 export function recordDecision(layer: string, allowed: boolean): void {
   limiterDecisions.inc({ layer, decision: allowed ? 'allow' : 'block' });
 }

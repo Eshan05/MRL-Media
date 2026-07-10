@@ -13,6 +13,7 @@
     margin: 2rem auto;
     padding: 0 1rem;
     line-height: 1.5;
+    overflow-x: hidden;
   }
   h1 { font-size: 1.3rem; }
   p.sub { opacity: 0.7; margin-top: -0.5rem; }
@@ -38,7 +39,9 @@
     cursor: pointer;
   }
   button:hover { background: #8882; }
-  table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
+  table { border-collapse: collapse; width: 100%; min-width: 760px; font-size: 0.85rem; }
+  .files-table { min-width: 640px; }
+  .table-scroll { width: 100%; overflow-x: auto; }
   th, td { text-align: left; padding: 0.35rem 0.6rem; border-bottom: 1px solid #8883; }
   th { opacity: 0.6; font-weight: 600; }
   .ok { color: #16a34a; font-weight: 600; }
@@ -107,14 +110,17 @@
   </p>
 
   <div class="stack" id="files-panel" style="display:none">
-    <table>
+    <div class="table-scroll">
+    <table class="files-table">
       <thead>
-        <tr><th>file</th><th>visibility</th><th>share</th><th>actions</th></tr>
+        <tr><th>file</th><th>state</th><th>visibility</th><th>share</th><th>actions</th></tr>
       </thead>
       <tbody id="files"></tbody>
     </table>
+    </div>
   </div>
 
+  <div class="table-scroll">
   <table>
     <thead>
       <tr>
@@ -124,6 +130,7 @@
     </thead>
     <tbody id="log"></tbody>
   </table>
+  </div>
 
 <script>
   const $ = (id) => document.getElementById(id);
@@ -203,6 +210,7 @@
       const tr = document.createElement('tr');
       tr.innerHTML =
         `<td>${name}<br><small>${esc(f.bytes)} B</small></td>` +
+        `<td>${esc(f.state ?? '')}</td>` +
         `<td>${esc(f.visibility)}</td>` +
         `<td>${f.mediaUrl ? `<a href="${mediaUrl}" target="_blank">open</a>` : '<span class="hint">regenerate private link</span>'}</td>` +
         `<td>` +
@@ -247,6 +255,7 @@
       : (r.bytes != null
           ? `<a href="${esc(r.mediaUrl)}" target="_blank" data-open-url="${esc(r.mediaUrl)}">${esc(r.filename)} · ${esc(r.bytes)} B</a>` +
             (r.visibility ? ` · ${esc(r.visibility)}` : '') +
+            (r.state ? ` · ${esc(r.state)}` : '') +
             (r.expiresAt ? ` · expires ${new Date(r.expiresAt).toLocaleDateString()}` : '') +
             (r.statusUrl ? ` · <a href="${esc(r.statusUrl)}" data-job="${esc(r.statusUrl)}">job</a>` : '')
           : esc(r.error ?? ''));
@@ -280,7 +289,7 @@
       if ($('hook').value) headers['x-webhook-url'] = $('hook').value;
       const fd = new FormData();
       fd.append('file', file);
-      const res = await fetch('/upload', { method: 'POST', headers, body: fd });
+      const res = await fetch('/api/v1/uploads', { method: 'POST', headers, body: fd });
       let body = {};
       try { body = await res.json(); } catch {}
       row({
@@ -295,12 +304,13 @@
         filename: body.filename,
         storedAs: body.storedAs,
         visibility: body.visibility,
+        state: body.state,
         mediaUrl: body.mediaUrl,
         expiresAt: body.expiresAt,
         statusUrl: body.statusUrl,
         error: body.error,
       });
-      if (res.status === 201 && key()) loadFiles();
+      if (res.ok && key()) loadFiles();
     } catch (err) {
       row({ status: 0, error: String(err) });
     }

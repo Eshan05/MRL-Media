@@ -17,7 +17,7 @@ function form(name, text) {
 }
 
 async function upload(headers, name, text) {
-  const res = await fetch(`${BASE}/upload`, {
+  const res = await fetch(`${BASE}/api/v1/uploads`, {
     method: 'POST',
     headers,
     body: form(name, text),
@@ -37,8 +37,8 @@ const anonPublic = await upload(
   `anon public ${Date.now()}`,
 );
 report(
-  'anonymous public upload -> 201',
-  anonPublic.res.status === 201 &&
+  'anonymous public upload -> 202',
+  anonPublic.res.status === 202 &&
     anonPublic.body.actor === 'anonymous' &&
     anonPublic.body.visibility === 'public' &&
     anonPublic.body.expiresAt &&
@@ -59,7 +59,7 @@ const anonPrivate = await upload(
 );
 report(
   'anonymous private upload returns one-time code link',
-  anonPrivate.res.status === 201 &&
+  anonPrivate.res.status === 202 &&
     anonPrivate.body.visibility === 'private' &&
     anonPrivate.body.privateCode &&
     anonPrivate.body.mediaUrl?.includes('code='),
@@ -89,7 +89,7 @@ report('invalid auth does not downgrade to anonymous', invalidAuth.res.status ==
 const user = await adminUser(BASE, { name: `share-${Date.now()}` });
 const auth = { authorization: `Bearer ${user.apiKey}`, 'x-media-visibility': 'private' };
 const owned = await upload(auth, 'owned-private.txt', 'owned private');
-report('authenticated private upload -> 201', owned.res.status === 201 && owned.body.statusUrl, `${owned.res.status}`);
+report('authenticated private upload -> 202', owned.res.status === 202 && owned.body.statusUrl, `${owned.res.status}`);
 
 const listed = await fetch(`${BASE}/files`, { headers: { authorization: `Bearer ${user.apiKey}` } });
 const listBody = await listed.json();

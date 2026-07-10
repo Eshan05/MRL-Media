@@ -33,7 +33,7 @@ Pace uploads so the token bucket does not fire first.
 
 ```powershell
 for ($i=1; $i -le 20; $i++) {
-  $out = curl.exe -s -i -X POST "$base/upload" `
+  $out = curl.exe -s -i -X POST "$base/api/v1/uploads" `
     -H "authorization: Bearer $key" `
     -F "file=@$small;filename=l2-$i.txt"
 
@@ -50,7 +50,7 @@ Use a fresh key if earlier tests already recorded violations on the current key.
 
 ```powershell
 for ($i=1; $i -le 8; $i++) {
-  $out = curl.exe -s -i -X POST "$base/upload" `
+  $out = curl.exe -s -i -X POST "$base/api/v1/uploads" `
     -H "authorization: Bearer $key" `
     -F "file=@$small;filename=l3-$i.txt"
 
@@ -69,18 +69,18 @@ $big = "$env:TEMP\mrl-big.bin"
 fsutil file createnew $big 30000000
 
 Start-Job { param($base,$key,$big)
-  curl.exe -i --limit-rate 20k -X POST "$base/upload" `
+  curl.exe -i --limit-rate 20k -X POST "$base/api/v1/uploads" `
     -H "authorization: Bearer $key" `
     -F "file=@$big;type=application/octet-stream"
 } -ArgumentList $base,$key,$big
 
 Start-Job { param($base,$key,$big)
-  curl.exe -i --limit-rate 20k -X POST "$base/upload" `
+  curl.exe -i --limit-rate 20k -X POST "$base/api/v1/uploads" `
     -H "authorization: Bearer $key" `
     -F "file=@$big;type=application/octet-stream"
 } -ArgumentList $base,$key,$big
 
-curl.exe -i --limit-rate 20k -X POST "$base/upload" `
+curl.exe -i --limit-rate 20k -X POST "$base/api/v1/uploads" `
   -H "authorization: Bearer $key" `
   -F "file=@$big;type=application/octet-stream"
 ```
@@ -102,14 +102,14 @@ If worker is alive, use a webhook.site/ngrok URL:
 $hook = "https://webhook.site/your-id"
 
 for ($i=1; $i -le 4; $i++) {
-  curl.exe -s -i -X POST "$base/upload" `
+  curl.exe -s -i -X POST "$base/api/v1/uploads" `
     -H "authorization: Bearer $key" `
     -H "x-webhook-url: $hook" `
     -F "file=@$small;filename=l5-$i.txt"
 }
 ```
 
-Expected: uploads return `201`; webhook deliveries are delayed/paced. With burst
+Expected: uploads return `202`; webhook deliveries are delayed/paced. With burst
 `2`, the first two may arrive close together, then later deliveries should be
 roughly `2s` apart. This layer delays jobs; it is not a 429 response.
 
@@ -118,7 +118,7 @@ roughly `2s` apart. This layer delays jobs; it is not a 429 response.
 Check trust before and after a deliberate violation.
 
 ```powershell
-curl.exe -i -X POST "$base/upload" `
+curl.exe -i -X POST "$base/api/v1/uploads" `
   -H "authorization: Bearer $key" `
   -F "file=@$small;filename=trust-before.txt"
 ```
@@ -129,14 +129,14 @@ Then trigger violations, usually through L3:
 
 ```powershell
 for ($i=1; $i -le 8; $i++) {
-  curl.exe -s -i -X POST "$base/upload" `
+  curl.exe -s -i -X POST "$base/api/v1/uploads" `
     -H "authorization: Bearer $key" `
     -F "file=@$small;filename=trust-violate-$i.txt"
 }
 
 Start-Sleep -Seconds 10
 
-curl.exe -i -X POST "$base/upload" `
+curl.exe -i -X POST "$base/api/v1/uploads" `
   -H "authorization: Bearer $key" `
   -F "file=@$small;filename=trust-after.txt"
 ```

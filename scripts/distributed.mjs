@@ -1,5 +1,5 @@
 // Distributed correctness — the reason limiter state lives in redis at all.
-// Run several API instances against ONE redis (and one sqlite file) and
+// Run several API instances against one Redis and one PostgreSQL database and
 // prove the limits hold globally, not per instance.
 //
 //   TRUST_PROXY=1 ADMIN_KEY=dev-admin PORT=3211 tsx src/api/server.ts   (and 3212, 3213)

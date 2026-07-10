@@ -1,4 +1,4 @@
-# LEARNING.md — the six algorithms, in order
+# LEARNING.md - five mechanisms across six policy layers
 
 How to use this: one layer per sitting. For each layer — read the concept
 here, then the Lua script (they're short), then **predict what each test in
@@ -108,7 +108,8 @@ tokens = min(capacity, tokens + elapsed_seconds × rate)
 ```
 
 `capacity` is the burst (album dump), `rate` is the sustained average.
-That's the shape uploads have, which is why this layer guards `/upload`.
+That's the shape uploads have, which is why this layer guards
+`POST /api/v1/uploads` (with `/upload` retained as a compatibility route).
 
 **Things to notice in the script:** fresh ids start with a *full* bucket
 (first impression matters — and it means an attacker cycling ids gets
@@ -219,31 +220,30 @@ legitimate-but-bursty user from spiraling? Design the escape hatch.
 
 ---
 
-## Wiring it into MRL-Media (the remaining build)
+## Wiring it into MRL-Media
 
-Ordered so each step is independently shippable:
+The current application connects the mechanisms to a durable media workflow:
 
-1. ~~**Auth stub**~~ — done as the `x-user-id` header in `server.ts`. Still
-   open: a real users table (created_at gives you `accountAgeDays`, tier
-   gives you `slots`) instead of the stubbed signals.
-2. ~~**Layers 2, 3, 6 in `server.ts`**~~ — done: sliding window per user,
-   token bucket on `POST /upload`, both scaled by `trustMultiplier`,
-   `violationTracker.record()` on every 429, real `Retry-After` headers.
+1. **Authentication and ownership** use Better Auth, API keys, and PostgreSQL.
+   Account creation time and tier provide real adaptive and concurrency inputs.
+2. **Layers 2, 3, and 6** apply a sliding window per user and a token bucket on
+   `POST /api/v1/uploads`, both scaled by `trustMultiplier`.
    Study it live: `pnpm dev:api`, open `/`, hit "Spam ×12" and read the log
    bottom-up — bucket drains (5×200), token bucket fires (429s), each 429
    drops trust, and then **the sliding window starts blocking because the
    shrunken trust multiplier lowered its scaled limit below what was already
    spent**. That's the layer-6 feedback loop from the exercise, visible in
    one click.
-3. ~~**Real uploads**~~ — done: streaming multipart to `uploads/`. Still
-   open: job row in SQLite + `queue.add()` to BullMQ.
-4. ~~**Worker + layer 4**~~ — done: `src/worker/index.ts`. Tier slots
+3. **Durable uploads** stream multipart data to temporary storage, persist the
+   object, and commit file state plus a PostgreSQL outbox event. The worker
+   dispatches that event to BullMQ, so accepted work survives worker downtime.
+4. **Worker + layer 4** use tier slots
    (free 3 / pro 10) via the semaphore; when no slot is free the job is
    parked with `moveToDelayed` instead of burning a worker — the BullMQ
    manual-limit pattern. Note the same primitive also guards *uploads in
    flight* in `server.ts` (free 2 / pro 5) — one semaphore, two different
    scarce resources (sockets+disk there, CPU+RAM here).
-5. ~~**Webhooks + layer 5**~~ — done: the webhook worker checks
+5. **Webhooks + layer 5** check
    `gcra.check(host)` and, when blocked, delays the job to GCRA's exact
    `retryAt` — no guessing, no generic backoff for the pacing case (HTTP
    failures still retry with exponential backoff, a different concern).
@@ -307,7 +307,7 @@ Proven on this machine (scripts in `scripts/`):
 - **Artillery local profile** (`pnpm scale:artillery`): same intent in a
   standard tool. The test uses constant-arrival/ramp phases, rotates
   `x-forwarded-for` to avoid measuring only layer 1, and sends a small
-  multipart upload sample through `/upload`.
+  multipart upload sample through `/api/v1/uploads`.
 - **Compose replica smoke** (`pnpm scale:compose`): boots redis, one worker,
   nginx, and a configurable number of API replicas. The script writes an
   explicit nginx upstream for the requested replica count, confirms nginx

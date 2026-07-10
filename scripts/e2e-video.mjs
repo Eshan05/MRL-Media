@@ -39,18 +39,18 @@ if (ff.status !== 0) throw new Error('failed to generate test video with ffmpeg'
 const { apiKey } = await adminUser(BASE, { name: `video-${Date.now()}`, tier: 'pro' });
 const fd = new FormData();
 fd.append('file', new File([readFileSync(tmp)], 'video-smoke.mp4', { type: 'video/mp4' }));
-const upload = await fetch(`${BASE}/upload`, {
+const upload = await fetch(`${BASE}/api/v1/uploads`, {
   method: 'POST',
   headers: { authorization: `Bearer ${apiKey}` },
   body: fd,
 });
 const body = await upload.json();
-if (upload.status !== 201) throw new Error(`upload failed: ${upload.status} ${JSON.stringify(body)}`);
+if (upload.status !== 202) throw new Error(`upload failed: ${upload.status} ${JSON.stringify(body)}`);
 
 const deadline = Date.now() + 30_000;
 let job;
 while (Date.now() < deadline) {
-  const res = await fetch(`${BASE}/jobs/${body.id}`, { headers: { authorization: `Bearer ${apiKey}` } });
+  const res = await fetch(`${BASE}/api/v1/jobs/${body.id}`, { headers: { authorization: `Bearer ${apiKey}` } });
   job = await res.json();
   if (job.state === 'completed') break;
   if (job.state === 'failed') throw new Error(`transcode failed: ${job.failedReason}`);

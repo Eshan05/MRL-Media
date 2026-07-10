@@ -1,7 +1,4 @@
 <div align="center">
-  <img src="docs/images/Initial.png" alt="MRL-Media logo" />
-  
-  <br />
   <div>
     <img src="https://img.shields.io/badge/-Node.js-111827?style=for-the-badge&logo=node.js&logoColor=white&color=339933" alt="nodejs" />
     <img src="https://img.shields.io/badge/-TypeScript-111827?style=for-the-badge&logo=typescript&logoColor=white&color=3178c6" alt="typescript" />
@@ -14,7 +11,7 @@
   <h3 align="center">MRL-Media <br /> Distributed Rate Limiter + Media Worker</h3>
 
   <div align="center">
-    Media upload API built to make six rate-limiting algorithms real:
+    Media upload API built around five limiter mechanisms across six policy layers:
     Anonymous and authenticated uploads, worker slots, webhook pacing, adaptive trust,
     Redis Lua atomicity, and local scale / chaos proof.
   </div>
@@ -22,7 +19,9 @@
 
 ## 🍁 Overview
 
-MRL-Media is a project that has an impact while helping me learn six different rate limiting algorithms and how to use them with Redis.
+MRL-Media is a distributed media-ingestion playground for studying how rate
+limiting, durable queues, storage, and worker backpressure interact in a real
+request pipeline.
 
 ## 💻 Technologies
 
@@ -32,11 +31,11 @@ MRL-Media is a project that has an impact while helping me learn six different r
 [![PostgreSQL](https://skillicons.dev/icons?i=postgres "PostgreSQL")](https://www.postgresql.org/ "PostgreSQL")
 [![Docker](https://skillicons.dev/icons?i=docker "Docker")](https://www.docker.com/ "Docker")
 
-- **Language**: TypeScript
+- **Language**: TypeScript 7
 - **API**: Fastify 5, Multipart streaming uploads
 - **Auth**: `better-auth` email & password + API keys for owned uploads
 - **Rate limiting**: Redis + Lua for fixed window, sliding window, token bucket, semaphore, GCRA, and violation tracking
-- **Workers**: BullMQ queues for media processing and webhook delivery
+- **Workers**: PostgreSQL transactional outbox + BullMQ media and webhook queues
 - **Storage**: provider interface with local dev, PostgreSQL object fallback, and S3-compatible AWS/R2/MinIO adapter
 - **Media**: sharp for image derivatives, ffmpeg for video poster/web mp4 output
 - **Observability**: Prometheus `/metrics`, worker heartbeat, queue depth gauges
@@ -61,7 +60,7 @@ MRL-Media is a project that has an impact while helping me learn six different r
 - 🔑 **Bearer or `x-api-key` authentication** for API clients.
 - 🌐 **Anonymous uploads** with lower IP-keyed limits, no listing / editing, and automatic expiry.
 - 🔗 **Public/private media links**: public files read at `/media/:name`. Private files require a one-time secret code link.
-- 🗃️ **Drizzle-managed Postgres schema** plus app-owned file/object rows.
+- 🗃️ **Drizzle-managed Postgres schema** with durable processing state and an outbox for accepted uploads.
 - 🧾 **Owner-only file management**: `/files/*` is authenticated; strangers get 404, anonymous users get 401.
 - 🖼️ **Image derivatives**: thumbnail and web-optimized webp outputs.
 - 🎞️ **Video derivatives**: poster thumbnail plus web mp4 output through ffmpeg.
@@ -70,6 +69,7 @@ MRL-Media is a project that has an impact while helping me learn six different r
 ### Worker and Webhook Pipeline
 
 - 📬 **BullMQ transcode queue** for media jobs.
+- 🧾 **Transactional outbox dispatch** so worker downtime cannot silently lose an accepted processing job.
 - 🧷 **Tiered worker slots**: free/pro users get different transcode concurrency.
 - 🔁 **Webhook retry path** with exponential backoff for HTTP failures.
 - 📏 **GCRA pacing** delays webhook jobs to the exact `retryAt` timestamp.
@@ -78,7 +78,7 @@ MRL-Media is a project that has an impact while helping me learn six different r
 
 ### Proof and Operations
 
-- 📊 **Prometheus metrics** for limiter decisions, queue depth, and worker heartbeat age.
+- 📊 **Prometheus metrics** for limiter decisions, queue/outbox depth, and worker heartbeat age.
 - 🧬 **Redis Cluster-safe keys** using hash tags so Lua scripts stay in one slot.
 - 🧨 **Chaos script** that proves worker death/restart visibility, Redis fail-closed behavior, and split API/worker storage.
 - ⚖️ **Distributed correctness script** proving shared Redis state across API instances.
@@ -93,7 +93,9 @@ flowchart LR
   API --> Auth[Better Auth + Drizzle + Postgres]
   API --> Redis[(Redis / Redis Cluster)]
   API --> Storage[(Object storage: S3/R2 or DB fallback)]
-  API --> Queue[BullMQ queues]
+  API --> Outbox[(Postgres job outbox)]
+  Outbox --> Dispatcher[Worker outbox dispatcher]
+  Dispatcher --> Queue[BullMQ queues]
   Queue --> Worker[Media + webhook worker]
   Worker --> Redis
   Worker --> Storage
@@ -131,13 +133,13 @@ expire after `ANON_RETENTION_DAYS` days, default `7`.
 ### API Flow
 
 ```bash
-# No-account public upload
-curl -i -X POST http://localhost:3000/upload \
+# No-account public upload (202 after durable acceptance)
+curl -i -X POST http://localhost:3000/api/v1/uploads \
   -H 'x-media-visibility: public' \
   -F 'file=@some-image.jpg'
 
 # No-account private upload
-curl -i -X POST http://localhost:3000/upload \
+curl -i -X POST http://localhost:3000/api/v1/uploads \
   -H 'x-media-visibility: private' \
   -F 'file=@some-image.jpg'
 
@@ -145,7 +147,7 @@ KEY=$(curl -s -X POST http://localhost:3000/signup \
   -H 'content-type: application/json' \
   -d '{"name":"me","email":"me@example.test","password":"password-12345"}' | jq -r .apiKey)
 
-curl -i -X POST http://localhost:3000/upload \
+curl -i -X POST http://localhost:3000/api/v1/uploads \
   -H "authorization: Bearer $KEY" \
   -H 'x-media-visibility: private' \
   -F "file=@some-image.jpg"
@@ -156,6 +158,10 @@ curl -i -X PATCH http://localhost:3000/files/<file-id> \
   -H 'content-type: application/json' \
   -d '{"visibility":"public"}'
 ```
+
+Authenticated upload responses include `state: "pending"` and a versioned
+`statusUrl`. Poll that URL until the persisted state is `completed` or
+`failed`. Legacy `/upload` and `/jobs/:id` routes remain available.
 
 Responses include both project-specific headers and IETF-style rate-limit
 headers:
@@ -213,7 +219,7 @@ pnpm exec tsx src/api/server.ts
 ## 🧰 Commands
 
 ```bash
-pnpm test                  # Vitest limiter/security tests
+pnpm test                  # Redis/Postgres limiter, security, and persistence tests
 pnpm lint:ts               # TypeScript check
 pnpm test:slow             # L2 full-trust + L5 retry edge proofs
 pnpm e2e:video             # Generate/upload mp4 and verify poster + web mp4
@@ -246,6 +252,7 @@ BETTER_AUTH_SECRET=change-me-at-least-32-bytes-long
 ADMIN_KEY=dev-admin
 TRUST_PROXY=0
 WEBHOOK_ALLOW_PRIVATE=0
+RUN_WORKER=1
 ANON_RETENTION_DAYS=7
 ANON_UPLOAD_BURST=2
 ANON_UPLOAD_REFILL_PER_SEC=0.1
@@ -274,15 +281,13 @@ REDIS_CLUSTER_NAT_MAP=host.docker.internal:7000=127.0.0.1:7000,host.docker.inter
 
 ## 📸 Screenshots
 
-<div align="center">
+![Authenticated playground with persisted completion](docs/images/feature-auth-state.png)
 
-![Authenticated playground](docs/images/feature-auth-state.png)
-![Concurrency limit firing](docs/images/feature-concurrency-limit.png)
-
-</div>
+![Mobile playground with contained data tables](docs/images/feature-mobile-state.png)
 
 ## 📝 Additional Notes
 
 - `WEBHOOK_ALLOW_PRIVATE=1` is for local tests only. Production must leave it off.
-- Render demo uses separate API/worker services with Render Postgres-backed object storage unless S3 credentials are provided.
+- The free Render demo co-locates API and worker processes and uses Postgres-backed object storage.
 - S3/R2 is the preferred production media store; Postgres object storage is the no-credentials fallback for small demo files.
+- This demo currently uses `drizzle-kit push`; reviewed PostgreSQL migrations remain production hardening work.

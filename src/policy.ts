@@ -54,5 +54,13 @@ export const POLICY = {
   },
   /** layer 6 — trust multiplier tuning (see limiter/adaptive.ts) */
   adaptive: { queueSoftLimit: 100, min: 0.1, max: 2 },
+  outbox: {
+    pollIntervalMs: 1_000,
+    batchSize: 25,
+    leaseMs: 30_000,
+    retryBaseMs: 1_000,
+    retryMaxMs: 60_000,
+  },
+  stagingTtlMs: 15 * 60_000,
   maxFileBytes: 50 * 1024 * 1024,
 } as const;

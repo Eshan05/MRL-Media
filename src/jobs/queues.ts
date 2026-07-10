@@ -5,6 +5,7 @@ import { parseClusterNatMap, parseClusterNodes } from '../limiter/redis.js';
 
 export const TRANSCODE_QUEUE = 'transcode';
 export const WEBHOOK_QUEUE = 'webhooks';
+export const HEARTBEAT_KEY = 'mrl:worker:heartbeat';
 
 /**
  * BullMQ requires its own connections with maxRetriesPerRequest: null

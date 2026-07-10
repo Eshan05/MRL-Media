@@ -104,6 +104,44 @@ flowchart LR
   API --> Metrics[Prometheus /metrics]
 ```
 
+### Durable Upload Lifecycle
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant API as Fastify API
+  participant DB as PostgreSQL
+  participant Storage as Object storage
+  participant Dispatcher as Outbox dispatcher
+  participant Queue as BullMQ
+  participant Worker as Media worker
+
+  Client->>API: POST /api/v1/uploads
+  API->>API: Stream multipart body to a temp file
+  API->>DB: Create staging file row
+  API->>Storage: Store original object
+  API->>DB: Transaction: file pending + outbox event
+  API-->>Client: 202 pending + statusUrl
+
+  Note over DB,Dispatcher: During worker downtime, the durable event remains pending
+  Dispatcher->>DB: Claim event with a lease
+  Dispatcher->>Queue: Enqueue deterministic job ID
+  Dispatcher->>DB: Mark event dispatched and file queued
+  Queue->>Worker: Deliver processing job
+  Worker->>DB: Mark file processing
+  Worker->>Storage: Write image or video derivatives
+
+  alt Processing succeeds
+    Worker->>DB: Mark completed and persist outputs
+  else Retries are exhausted
+    Worker->>DB: Mark failed and persist reason
+  end
+
+  Client->>API: GET /api/v1/jobs/:id
+  API->>DB: Read durable processing state
+  API-->>Client: pending, queued, processing, completed, or failed
+```
+
 ## 🧪 The Six Layers
 
 | #   | Algorithm             | Surface                | Why it belongs there                                           |
